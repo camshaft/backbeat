@@ -17,7 +17,7 @@ path = "src/main.rs"
 backbeat.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-arrow = "54"
+arrow = "59"
 # `zstd` so we can compress the (often large, highly repetitive) trace output.
 parquet = { version = "59", features = ["zstd"] }
 # Chrome/Perfetto trace output is JSON; rayon decodes multiple input dumps in parallel.
@@ -29,11 +29,11 @@ bytes = "1"
 # jemalloc is markedly faster than the system allocator on the alloc-heavy decode/convert path.
 # Unix-only; other targets fall back to the system allocator (see main.rs).
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 [dev-dependencies]
 # The end-to-end test defines events (needs the zerocopy derives) and reads converted output back.
 zerocopy = { version = "0.8", features = ["derive"] }
-arrow = "54"
+arrow = "59"
 parquet = "59"
 serde_json = "1"

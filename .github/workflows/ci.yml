@@ -24,7 +24,7 @@ jobs:
       rust-versions: ${{ steps.definitions.outputs.versions }}
       msrv: ${{ steps.definitions.outputs.msrv }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Evaluate definitions
         id: definitions
         run: |
@@ -44,7 +44,7 @@ jobs:
   rustfmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install rust toolchain
         id: toolchain
@@ -59,7 +59,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install rust toolchain
         id: toolchain
@@ -76,7 +76,7 @@ jobs:
   udeps:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         id: toolchain
@@ -98,7 +98,7 @@ jobs:
   no-std:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         id: toolchain
@@ -122,7 +122,7 @@ jobs:
         rust: ${{ fromJson(needs.env.outputs.rust-versions) }}
         os: [ubuntu-latest, macOS-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         id: toolchain
