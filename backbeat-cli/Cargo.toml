@@ -1,6 +1,6 @@
 [package]
 name = "backbeat-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "The backbeat CLI: inspect and convert self-describing trace dumps to Parquet"
 authors.workspace = true
 repository.workspace = true

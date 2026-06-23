@@ -1,6 +1,6 @@
 [package]
 name = "backbeat"
-version = "0.1.0"
+version = "0.1.1"
 description = "A system-wide flight recorder with a self-describing, schema-driven on-disk format"
 authors.workspace = true
 repository.workspace = true
