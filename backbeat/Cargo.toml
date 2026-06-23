@@ -25,6 +25,12 @@ categories = ["development-tools::debugging", "development-tools::profiling", "n
 default = ["std", "capture"]
 std = ["dep:inventory", "dep:libc"]
 capture = []
+# Makes the default `SystemClock` bach-aware: when the caller is inside a `bach` discrete-event
+# simulation, timestamps come from the simulated clock (deterministic, host-independent) instead of
+# the wall clock, so recorded events line up with simulated time. Outside a bach scope it falls back
+# to the wall clock, so a binary built with this on still behaves normally in production. Implies
+# `std` (bach is a std-only runtime).
+bach = ["std", "dep:bach"]
 
 [dependencies]
 backbeat-macros.workspace = true
@@ -38,6 +44,9 @@ inventory = { version = "0.3", optional = true }
 # The dump reader hands out records as zero-copy refcounted slices of the file buffer. `bytes` is
 # `no_std`+alloc, so this stays compatible with the `no_std` format half.
 bytes = { version = "1", default-features = false }
+# The `bach` feature makes the default clock query bach's simulated time when the recorder runs
+# inside a discrete-event simulation. Optional and off by default; pulled in only with `bach`.
+bach = { version = "0.1.2", optional = true }
 
 # The global recorder's optional `kill -<sig>` dump trigger installs a signal handler via libc.
 # Unix-only and only pulled in with `std` (the global recorder is `std`-only).
