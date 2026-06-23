@@ -4,7 +4,6 @@ corpus/
 crashes/
 target/
 **/*.rs.bk
-Cargo.lock
 *.tar.gz
 /.history
 .DS_Store
