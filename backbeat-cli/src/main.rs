@@ -18,11 +18,12 @@ use backbeat_cli::{convert, inspect, model, trace};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 
-// jemalloc handles the decode/convert path's many small allocations (and their cross-thread frees
-// under rayon) noticeably faster than the system allocator. Not available under MSVC.
-#[cfg(not(target_env = "msvc"))]
+// mimalloc handles the decode/convert path's many small allocations (and their cross-thread frees
+// under rayon) noticeably faster than the system allocator. We use it on every target: unlike
+// jemalloc — whose C build can't detect atomics under the musl cross-toolchain — mimalloc builds
+// cleanly on musl, macOS, and Windows alike, so the static portable binaries get the speedup too.
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(

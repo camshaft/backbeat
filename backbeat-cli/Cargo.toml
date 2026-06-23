@@ -29,11 +29,9 @@ serde_json = "1"
 rayon = "1"
 # Zero-copy refcounted slices: one arena buffer per dump, cheap per-record slices into it.
 bytes = "1"
-
-# jemalloc is markedly faster than the system allocator on the alloc-heavy decode/convert path.
-# Unix-only; other targets fall back to the system allocator (see main.rs).
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.7"
+# mimalloc is markedly faster than the system allocator on the alloc-heavy decode/convert path, and
+# builds on every target we ship (musl/macOS/Windows) — see the `#[global_allocator]` in main.rs.
+mimalloc = "0.1"
 
 [dev-dependencies]
 # The end-to-end test defines events (needs the zerocopy derives) and reads converted output back.
