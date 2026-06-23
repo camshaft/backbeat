@@ -136,6 +136,16 @@ impl Default for SystemClock {
 impl Clock for SystemClock {
     #[inline]
     fn now_nanos(&self) -> u64 {
+        // When built with `bach` and running inside a simulation, read the simulated clock so
+        // recorded timestamps line up with simulated time. `try_now` returns `None` when no bach
+        // scope is in scope (e.g. production), in which case we fall through to the wall clock.
+        // Bach time starts at the Unix epoch (`Duration::ZERO`), so elapsed-since-start *is* the
+        // nanos-since-epoch we store, deterministic and host-independent.
+        #[cfg(feature = "bach")]
+        if let Some(now) = bach::time::Instant::try_now() {
+            return now.elapsed_since_start().as_nanos() as u64;
+        }
+
         self.base_nanos
             .wrapping_add(self.start.elapsed().as_nanos() as u64)
     }
