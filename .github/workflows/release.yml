@@ -125,10 +125,32 @@ jobs:
       # `cargo publish` (Rust 1.66+) blocks until each version is live on the index before returning,
       # so the next crate in line resolves it. The workspace path deps carry an explicit `version`,
       # so cargo strips the local path and points at the just-published crates.io release.
+      #
+      # Idempotent: each crate is skipped if its current version is already on crates.io. This lets
+      # the job re-run safely (e.g. a tag whose crates were published manually, or a partial earlier
+      # run) without failing on "crate version already exists".
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish --locked -p backbeat-macros
-          cargo publish --locked -p backbeat
-          cargo publish --locked -p backbeat-cli
+          set -euo pipefail
+          publish() {
+            local crate="$1"
+            local version
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')"
+            # crates.io's sparse index path: a 4+ char name lives at {chars1-2}/{chars3-4}/{name}.
+            # All of our crate names are longer than four chars. The file lists every published
+            # version, one JSON object per line, so a matching "vers" means it's already up.
+            local url="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
+            if curl -fsSL -A "backbeat-release-ci" "$url" 2>/dev/null \
+                | jq -re --arg v "$version" 'select(.vers == $v) | .vers' >/dev/null 2>&1; then
+              echo "$crate $version already on crates.io; skipping."
+            else
+              echo "Publishing $crate $version..."
+              cargo publish --locked -p "$crate"
+            fi
+          }
+          publish backbeat-macros
+          publish backbeat
+          publish backbeat-cli
