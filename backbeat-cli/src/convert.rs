@@ -404,7 +404,7 @@ fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
     fields.push(Field::new("instance_id", DataType::UInt64, false));
     arrays.push(Arc::new(instance_id.finish()));
 
-    for (name, mut col) in key_names.iter().zip(key_cols.into_iter()) {
+    for (name, mut col) in key_names.iter().zip(key_cols) {
         // A promoted column may be declared by several events; describe it from the first.
         let decl = schemas
             .iter()

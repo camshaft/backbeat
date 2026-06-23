@@ -562,7 +562,9 @@ mod signal {
         // ([`handler`]) only calls async-signal-safe operations (see its docs).
         unsafe {
             let mut action: libc::sigaction = core::mem::zeroed();
-            action.sa_sigaction = handler as usize;
+            // `sa_sigaction` is a `usize`; go through a pointer rather than casting the function
+            // item straight to an integer (clippy's `function_casts_as_integer`).
+            action.sa_sigaction = handler as *const () as usize;
             action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(sig, &action, core::ptr::null_mut());
