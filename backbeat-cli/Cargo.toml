@@ -1,0 +1,39 @@
+[package]
+name = "backbeat-cli"
+version = "0.1.0"
+description = "The backbeat CLI: inspect and convert self-describing trace dumps to Parquet"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Installs as the `backbeat` binary: `cargo install backbeat-cli` puts `backbeat` on your PATH.
+[[bin]]
+name = "backbeat"
+path = "src/main.rs"
+
+[dependencies]
+backbeat.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+arrow = "54"
+# `zstd` so we can compress the (often large, highly repetitive) trace output.
+parquet = { version = "54", features = ["zstd"] }
+# Chrome/Perfetto trace output is JSON; rayon decodes multiple input dumps in parallel.
+serde_json = "1"
+rayon = "1"
+# Zero-copy refcounted slices: one arena buffer per dump, cheap per-record slices into it.
+bytes = "1"
+
+# jemalloc is markedly faster than the system allocator on the alloc-heavy decode/convert path.
+# Unix-only; other targets fall back to the system allocator (see main.rs).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+# The end-to-end test defines events (needs the zerocopy derives) and reads converted output back.
+zerocopy = { version = "0.8", features = ["derive"] }
+arrow = "54"
+parquet = "54"
+serde_json = "1"

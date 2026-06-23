@@ -1,0 +1,46 @@
+[package]
+name = "backbeat"
+version = "0.1.0"
+description = "A system-wide flight recorder with a self-describing, schema-driven on-disk format"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# `std` is on by default and pulls in the recorder runtime + the inventory-based registry. Turn it
+# off (`default-features = false`) for the `no_std` format/descriptor half so events can be defined
+# in `no_std` crates. The CLI tooling (Parquet/inspect) lives in the separate `backbeat-cli` crate,
+# so a library consumer never pulls in arrow/parquet/clap.
+#
+# `capture` is the compile-time master switch for recording: on by default, but a build that depends
+# on `backbeat` with `default-features = false` (or `capture` off) gets a recorder whose `record`
+# calls compile to nothing — `is_enabled()` folds to `const false` and the optimizer strips the
+# rest. The runtime `set_enabled` toggle still exists when `capture` is on.
+default = ["std", "capture"]
+std = ["dep:inventory", "dep:libc"]
+capture = []
+
+[dependencies]
+backbeat-macros.workspace = true
+# Records are written by a plain memcpy of the event's bytes. `IntoBytes` makes that a checked,
+# zero-cost `as_bytes()`, and its derive *rejects* layouts with implicit padding — exactly what the
+# schema reader cannot describe. `default-features = false` keeps the format half `no_std`.
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+# Distributed slice of every `#[derive(Event)]` type compiled in, so the dumper self-populates the
+# registry. `std`-only (life-before-main collection).
+inventory = { version = "0.3", optional = true }
+# The dump reader hands out records as zero-copy refcounted slices of the file buffer. `bytes` is
+# `no_std`+alloc, so this stays compatible with the `no_std` format half.
+bytes = { version = "1", default-features = false }
+
+# The global recorder's optional `kill -<sig>` dump trigger installs a signal handler via libc.
+# Unix-only and only pulled in with `std` (the global recorder is `std`-only).
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# The derive-smoke test defines events, whose `IntoBytes`/`Immutable` derives emit `::zerocopy`
+# paths, so the test crate needs `zerocopy` directly.
+zerocopy = { version = "0.8", features = ["derive"] }
