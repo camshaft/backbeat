@@ -7,6 +7,10 @@ repository.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/backbeat"
+keywords = ["tracing", "flight-recorder", "observability", "profiling", "no-std"]
+categories = ["development-tools::debugging", "development-tools::profiling", "no-std"]
 
 [features]
 # `std` is on by default and pulls in the recorder runtime + the inventory-based registry. Turn it

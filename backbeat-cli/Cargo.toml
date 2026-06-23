@@ -7,6 +7,10 @@ repository.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/backbeat-cli"
+keywords = ["tracing", "flight-recorder", "parquet", "perfetto", "cli"]
+categories = ["command-line-utilities", "development-tools::debugging", "development-tools::profiling"]
 
 # Installs as the `backbeat` binary: `cargo install backbeat-cli` puts `backbeat` on your PATH.
 [[bin]]

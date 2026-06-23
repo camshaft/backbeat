@@ -7,6 +7,9 @@ repository.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+documentation = "https://docs.rs/backbeat-macros"
+keywords = ["tracing", "flight-recorder", "derive", "macro", "observability"]
+categories = ["development-tools::debugging", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true
