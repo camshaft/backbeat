@@ -29,7 +29,7 @@ bytes = "1"
 # jemalloc is markedly faster than the system allocator on the alloc-heavy decode/convert path.
 # Unix-only; other targets fall back to the system allocator (see main.rs).
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 [dev-dependencies]
 # The end-to-end test defines events (needs the zerocopy derives) and reads converted output back.
