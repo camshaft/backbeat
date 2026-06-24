@@ -61,20 +61,25 @@ struct Spliceable {
     metas: Vec<Vec<u8>>,
     interns: Vec<Vec<u8>>,
     shards: Vec<Vec<u8>>,
+    /// Query-DDL view sets (verbatim text). Dump-level like the registry — unioned by content
+    /// across inputs (a fleet of one binary carries identical copies), never per-instance.
+    views: Vec<String>,
 }
 
 /// Reads one dump into its [`Spliceable`] form. The Meta/Intern/Shard bodies are taken verbatim
-/// (never re-decoded); only the registry is parsed, so it can be unioned.
+/// (never re-decoded); only the registry and views are parsed, so they can be unioned.
 fn read_spliceable(path: &Path, bytes: bytes::Bytes) -> Result<Spliceable> {
     let reader = DumpReader::new(bytes)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("reading dump {}", path.display()))?;
     let schemas = reader.schemas().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let views = reader.views().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Spliceable {
         schemas,
         metas: reader.raw_bodies(SectionKind::Meta),
         interns: reader.raw_bodies(SectionKind::Intern),
         shards: reader.raw_bodies(SectionKind::Shard),
+        views,
     })
 }
 
@@ -100,6 +105,17 @@ fn merge_splice(inputs: &[PathBuf], output: &Path) -> Result<usize> {
         }
     }
     writer.schema_registry_owned(&registry);
+
+    // Union view sets by content, first-seen order — a fleet of one binary contributes identical
+    // copies, so dedup keeps the merged dump from carrying N redundant copies of the same DDL.
+    let mut seen_views = HashSet::new();
+    for s in &spliceables {
+        for sql in &s.views {
+            if seen_views.insert(sql.clone()) {
+                writer.views(sql);
+            }
+        }
+    }
 
     for s in spliceables {
         for body in s.metas {
@@ -141,6 +157,16 @@ fn merge_dedup(inputs: &[PathBuf], output: &Path) -> Result<usize> {
         }
     }
     writer.schema_registry_owned(&registry);
+
+    // Union view sets across inputs by content (first-seen order), from the already-loaded dumps —
+    // `Loaded` carries the dump's views, so no second read of the files (the splice path unions
+    // from `Spliceable.views` the same way).
+    let mut seen_views = HashSet::new();
+    for sql in dumps.iter().flat_map(|d| &d.views) {
+        if seen_views.insert(sql.clone()) {
+            writer.views(sql);
+        }
+    }
 
     // Group the de-duplicated records by their owning (instance_id, shard_id). `unique_records`
     // drops any record re-captured by an overlapping dump, so each survivor is emitted once.

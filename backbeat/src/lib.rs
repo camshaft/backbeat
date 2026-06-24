@@ -28,7 +28,12 @@
 //! rec.record(&PacketSent { connection_id: 7, len: 1200, _pad: [0; 4] });
 //!
 //! // Dump every event compiled in (the registry self-populates via the derive).
-//! let dump = rec.dump(backbeat::registry::schemas(), std::iter::empty(), "my-host");
+//! let dump = rec.dump(
+//!     backbeat::registry::schemas(),
+//!     std::iter::empty(),
+//!     backbeat::registry::views(),
+//!     "my-host",
+//! );
 //! # let _ = dump;
 //! ```
 //!
@@ -128,4 +133,37 @@ macro_rules! register_event {
 #[macro_export]
 macro_rules! register_event {
     ($ty:ty) => {};
+}
+
+/// Registers a set of query DDL — opaque SQL (typically DuckDB `CREATE VIEW`/`CREATE MACRO`
+/// statements) describing how to query this binary's events — so the dumper embeds it in every dump.
+///
+/// A consumer calls this once (usually `include_str!`-ing a `.sql` file kept next to its event
+/// definitions) so a dump carries not just how to *decode* its events but how to *query* them. The
+/// text is stored and embedded verbatim; backbeat never parses it. The CLI's `convert` appends these
+/// registered sets after the views it derives from the schema registry, then writes the combined DDL
+/// to a `.sql` sidecar and the Parquet footer.
+///
+/// ```ignore
+/// backbeat::register_views!(include_str!("frame_trace.views.sql"));
+/// ```
+///
+/// Like [`register_event!`], this submits into `inventory`'s distributed slice on `std` and expands
+/// to nothing under `no_std` (where life-before-main collection is unavailable).
+#[cfg(feature = "std")]
+#[macro_export]
+macro_rules! register_views {
+    ($sql:expr) => {
+        $crate::inventory::submit! {
+            $crate::registry::ViewSet::new($sql)
+        }
+    };
+}
+
+/// `no_std` build: auto-registration is unavailable, so this expands to nothing. See the `std`
+/// variant for the real behavior.
+#[cfg(not(feature = "std"))]
+#[macro_export]
+macro_rules! register_views {
+    ($sql:expr) => {};
 }

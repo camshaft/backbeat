@@ -43,3 +43,29 @@ pub fn schemas() -> impl Iterator<Item = &'static EventSchema> {
 pub fn len() -> usize {
     inventory::iter::<Registration>.into_iter().count()
 }
+
+/// One registered set of query DDL — opaque SQL text (typically DuckDB `CREATE VIEW`/`CREATE MACRO`
+/// statements) describing how to query this binary's events. A consumer submits one via
+/// [`register_views!`](crate::register_views), usually `include_str!`-ing a `.sql` file next to its
+/// event definitions; [`views`] reads them back so the dumper can embed them. backbeat never parses
+/// the text — it travels with the dump so a reader knows not just how to decode the events but how
+/// to query them.
+pub struct ViewSet {
+    /// The DDL text, stored and embedded verbatim.
+    pub sql: &'static str,
+}
+
+impl ViewSet {
+    /// Creates a view-set registration. Called by [`register_views!`](crate::register_views).
+    pub const fn new(sql: &'static str) -> Self {
+        Self { sql }
+    }
+}
+
+inventory::collect!(ViewSet);
+
+/// Every registered [`ViewSet`]'s DDL text, in unspecified order. This is the set the dumper embeds
+/// as [`Views`](crate::format::SectionKind::Views) sections.
+pub fn views() -> impl Iterator<Item = &'static str> {
+    inventory::iter::<ViewSet>.into_iter().map(|v| v.sql)
+}

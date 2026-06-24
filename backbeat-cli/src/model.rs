@@ -50,6 +50,10 @@ pub struct Loaded {
     /// The dump's schema registry, sorted by `qualified_name` for deterministic output. Shared by
     /// every instance in the same file (the registry is unified, not per-instance).
     pub schemas: Vec<OwnedSchema>,
+    /// The dump's registered query-DDL view sets (verbatim text), in file order. Dump-level like the
+    /// registry — every instance decoded from one file carries the same list (convert dedups by
+    /// content across files).
+    pub views: Vec<String>,
     /// This instance's interned `id → string` for `Interned` fields.
     pub intern: HashMap<u32, String>,
     /// Every valid record from this instance's shards, in global `(ts_nanos, shard_id, local_seq)`
@@ -93,6 +97,7 @@ pub fn load(path: &Path, bytes: Bytes) -> Result<Vec<Loaded>> {
     let mut schemas = reader.schemas().map_err(|e| anyhow::anyhow!("{e}"))?;
     let intern_tables = reader.intern_tables().map_err(|e| anyhow::anyhow!("{e}"))?;
     let metas = reader.metas().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let views = reader.views().map_err(|e| anyhow::anyhow!("{e}"))?;
     let shards = reader.shards().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Deterministic registry order regardless of how the producer's inventory was linked. Shared by
@@ -204,6 +209,7 @@ pub fn load(path: &Path, bytes: Bytes) -> Result<Vec<Loaded>> {
                 instance_id,
                 host: host_of.get(&instance_id).cloned().unwrap_or_default(),
                 schemas: schemas.clone(),
+                views: views.clone(),
                 intern: intern_by_instance.remove(&instance_id).unwrap_or_default(),
                 records,
             }

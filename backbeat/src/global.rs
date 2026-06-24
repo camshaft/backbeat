@@ -377,6 +377,7 @@ fn spawn_dumper() {
                         let bytes = g.recorder.dump(
                             crate::registry::schemas(),
                             core::iter::empty(),
+                            crate::registry::views(),
                             &g.host,
                         );
                         // Best-effort: a failed dump must not take down the process.

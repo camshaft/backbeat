@@ -50,6 +50,26 @@ struct PacketSent {
     _pad: [u8; 3],
 }
 
+/// An event with a sentinel-marked optional field: `dump_id` is absent (sentinel `0`) on most rows.
+#[derive(Event, IntoBytes, Immutable)]
+#[event(namespace = "test::net")]
+#[repr(C)]
+struct Frame {
+    #[event(key)]
+    conn_id: u64,
+    /// Debug-dump id, or `0` when this frame is not part of a debug capture.
+    #[event(key, sentinel = 0)]
+    dump_id: u64,
+    /// Stream offset, or `u64::MAX` when not applicable to this frame kind.
+    #[event(sentinel = u64::MAX)]
+    offset: u64,
+    /// A signed code, `-1` = absent. Exercises sentinel masking on a narrow signed field: `-1 as
+    /// u64` sign-extends, but the macro masks to the field width so it matches the on-disk image.
+    #[event(sentinel = -1)]
+    code: i32,
+    _pad: [u8; 4],
+}
+
 /// A request began.
 #[derive(Event, IntoBytes, Immutable)]
 #[event(namespace = "test::work", span = enter)]
@@ -71,6 +91,15 @@ struct RequestEnd {
     /// Bytes written during the request — captured at drop time.
     bytes: u64,
 }
+
+// A Tier-2 view set registered by this test crate. The dumper picks it up via inventory and embeds
+// it; `convert` appends it after the generated Tier-1 views. References the Tier-1 `packets_by_conn`
+// inputs (the base `events` view + promoted `conn_id` column) to prove the layering works.
+backbeat::register_views!(
+    "-- test domain overlay\n\
+     CREATE OR REPLACE MACRO packets_for(c) AS TABLE\n  \
+     SELECT * FROM \"test::net::PacketSent\" WHERE conn_id = c;\n"
+);
 
 /// Drives the recorder with a manual clock so timestamps are deterministic and ordered.
 fn dump_with_three_records() -> Vec<u8> {
@@ -103,7 +132,8 @@ fn dump_with_three_records() -> Vec<u8> {
 
     // The inventory registry auto-collected both event types since they derive Event in a std bin.
     let schemas: Vec<_> = backbeat::registry::schemas().collect();
-    rec.dump(schemas, std::iter::empty(), "")
+    let views: Vec<_> = backbeat::registry::views().collect();
+    rec.dump(schemas, std::iter::empty(), views, "")
 }
 
 #[test]
@@ -200,7 +230,12 @@ fn span_guard_records_enter_and_exit_with_paired_id() {
     let schemas: Vec<_> = backbeat::registry::schemas().collect();
     let start_id = RequestStart::ID.get();
     let end_id = RequestEnd::ID.get();
-    let dump = rec.dump(schemas.iter().copied(), std::iter::empty(), "");
+    let dump = rec.dump(
+        schemas.iter().copied(),
+        std::iter::empty(),
+        std::iter::empty(),
+        "",
+    );
 
     let reader = DumpReader::new(dump).unwrap();
     let owned_schemas = reader.schemas().unwrap();
@@ -338,6 +373,153 @@ fn convert_writes_readable_parquet() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn convert_emits_views_to_footer_and_sidecar() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let bytes = dump_with_three_records();
+    let dir = std::env::temp_dir().join("backbeat_e2e_views");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("out.parquet");
+
+    let loaded = backbeat_cli::model::load(std::path::Path::new("in.bb"), bytes.into()).unwrap();
+    backbeat_cli::convert::to_parquet(&loaded, &path, "", 3).unwrap();
+
+    // The sidecar exists next to the Parquet and binds the base `events` view to it.
+    let sidecar = dir.join("out.views.sql");
+    let sql = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(sql.contains("CREATE OR REPLACE VIEW events AS SELECT * FROM read_parquet("));
+    // Tier-1: a per-event-type view filtered by the stable event id.
+    assert!(sql.contains(
+        r#"CREATE OR REPLACE VIEW "test::net::PacketSent" AS SELECT * FROM events WHERE event_id ="#
+    ));
+    // Tier-1: the key-discovery manifest, listing the promoted conn_id key.
+    assert!(sql.contains("CREATE OR REPLACE VIEW backbeat_keys"));
+    assert!(sql.contains("'conn_id'"));
+    // Tier-2: the registered domain overlay rode through verbatim.
+    assert!(sql.contains("CREATE OR REPLACE MACRO packets_for(c)"));
+
+    // The footer carries the same DDL, minus the path-bound bootstrap (so it stays portable).
+    let file = std::fs::File::open(&path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let kv = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .expect("footer kv metadata");
+    let views_kv = kv
+        .iter()
+        .find(|k| k.key == "backbeat.views")
+        .expect("backbeat.views in footer");
+    let footer = views_kv.value.as_deref().unwrap();
+    assert!(footer.contains("CREATE OR REPLACE MACRO packets_for(c)"));
+    // Path-independent: the footer carries no `events`-binding statement and never names this
+    // conversion's output path (only the sidecar, which knows the path, has the bootstrap).
+    assert!(
+        !footer.contains("CREATE OR REPLACE VIEW events AS"),
+        "footer DDL must not bind the base view to a path"
+    );
+    assert!(
+        !footer.contains(&*path.to_string_lossy()),
+        "footer DDL must not reference the output path"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sentinel_fields_become_null_in_parquet() {
+    use arrow::array::{Array, StructArray, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let clock = Arc::new(ManualClock::new(1000));
+    let rec = Recorder::new(1, 64 * 1024).with_clock(clock.clone());
+    rec.set_enabled(true);
+    // Row 0: both optional fields absent (their sentinels). Row 1: both present.
+    rec.record(&Frame {
+        conn_id: 7,
+        dump_id: 0,       // sentinel → NULL
+        offset: u64::MAX, // sentinel → NULL
+        code: -1,         // sentinel → NULL (signed/narrow)
+        _pad: [0; 4],
+    });
+    clock.advance(10);
+    rec.record(&Frame {
+        conn_id: 7,
+        dump_id: 42,
+        offset: 100,
+        code: 5,
+        _pad: [0; 4],
+    });
+
+    let schemas: Vec<_> = backbeat::registry::schemas().collect();
+    let bytes = rec.dump(schemas, std::iter::empty(), std::iter::empty(), "");
+
+    let dir = std::env::temp_dir().join("backbeat_e2e_sentinel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("out.parquet");
+    let loaded = backbeat_cli::model::load(std::path::Path::new("in.bb"), bytes.into()).unwrap();
+    backbeat_cli::convert::to_parquet(&loaded, &path, "", 3).unwrap();
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    let schema = batch.schema();
+
+    // Rows are ts-ordered: row 0 is the sentinel frame, row 1 the populated one.
+    // Promoted key column `dump_id`: null on row 0, 42 on row 1.
+    let (didx, _) = schema.column_with_name("dump_id").unwrap();
+    let dump_id = batch
+        .column(didx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert!(dump_id.is_null(0), "sentinel dump_id should be NULL");
+    assert_eq!(dump_id.value(1), 42);
+
+    // Nested (non-key) struct field `offset`: null on row 0, 100 on row 1.
+    let (sidx, _) = schema.column_with_name("test::net::Frame").unwrap();
+    let frame_struct = batch
+        .column(sidx)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let offset = frame_struct
+        .column_by_name("offset")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert!(offset.is_null(0), "sentinel offset should be NULL");
+    assert_eq!(offset.value(1), 100);
+
+    // Signed/narrow sentinel (`code: i32`, sentinel `-1`): masked to the field width so the NULL
+    // mapping fires despite `-1 as u64` sign-extending. Null on row 0, 5 on row 1.
+    let code = frame_struct
+        .column_by_name("code")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert!(code.is_null(0), "sentinel code (-1 on i32) should be NULL");
+    assert_eq!(code.value(1), 5);
+
+    // The sentinel rides into the Parquet field metadata for self-description.
+    let (_, field) = schema.column_with_name("dump_id").unwrap();
+    assert_eq!(
+        field
+            .metadata()
+            .get("backbeat.sentinel")
+            .map(|s| s.as_str()),
+        Some("0")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Records a span, converts to Chrome-trace JSON, and asserts the paired `b`/`e` async events.
 fn dump_one_span() -> Vec<u8> {
     let clock = Arc::new(ManualClock::new(100));
@@ -357,7 +539,7 @@ fn dump_one_span() -> Vec<u8> {
         clock.advance(50);
     }
     let schemas: Vec<_> = backbeat::registry::schemas().collect();
-    rec.dump(schemas, std::iter::empty(), "")
+    rec.dump(schemas, std::iter::empty(), std::iter::empty(), "")
 }
 
 #[test]
@@ -487,7 +669,12 @@ fn merge_dedups_overlapping_dumps_of_one_recorder() {
         });
         clock.advance(10);
     }
-    let d1 = rec.dump(schemas.iter().copied(), std::iter::empty(), "");
+    let d1 = rec.dump(
+        schemas.iter().copied(),
+        std::iter::empty(),
+        std::iter::empty(),
+        "",
+    );
 
     // Three more, then a second snapshot — which still holds all six (the ring is large).
     for n in 3..6u64 {
@@ -500,7 +687,12 @@ fn merge_dedups_overlapping_dumps_of_one_recorder() {
         });
         clock.advance(10);
     }
-    let d2 = rec.dump(schemas.iter().copied(), std::iter::empty(), "");
+    let d2 = rec.dump(
+        schemas.iter().copied(),
+        std::iter::empty(),
+        std::iter::empty(),
+        "",
+    );
 
     let dir = std::env::temp_dir().join("backbeat_e2e_dedup");
     std::fs::create_dir_all(&dir).unwrap();

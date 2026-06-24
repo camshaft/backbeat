@@ -77,6 +77,11 @@ pub enum SectionKind {
     /// label. One process is one instance, so this lives at the dump level rather than on every
     /// record; the trace converter keys spans by `(instance_id, span_id)`.
     Meta = 3,
+    /// Consumer-supplied query DDL: opaque SQL text (typically DuckDB `CREATE VIEW`/`CREATE MACRO`
+    /// statements) a producer registers via `register_views!`, carried verbatim so a dump describes
+    /// not just how to decode its events but how to query them. backbeat never parses this text; the
+    /// CLI's `convert` appends it after the schema-derived views it generates.
+    Views = 4,
 }
 
 impl SectionKind {
@@ -88,6 +93,7 @@ impl SectionKind {
             1 => SectionKind::Intern,
             2 => SectionKind::Shard,
             3 => SectionKind::Meta,
+            4 => SectionKind::Views,
             _ => return None,
         })
     }
@@ -104,6 +110,7 @@ mod tests {
             SectionKind::Intern,
             SectionKind::Shard,
             SectionKind::Meta,
+            SectionKind::Views,
         ] {
             assert_eq!(SectionKind::from_u16(k as u16), Some(k));
         }

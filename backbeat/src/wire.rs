@@ -122,6 +122,8 @@ pub struct OwnedField {
     pub width: u16,
     pub role: FieldRole,
     pub unit: Option<String>,
+    /// In-band "absent" marker the converter maps to SQL NULL; see [`crate::schema::FieldSchema`].
+    pub sentinel: Option<u64>,
     pub enum_labels: Vec<OwnedEnumLabel>,
 }
 
@@ -267,6 +269,18 @@ impl DumpWriter {
         });
     }
 
+    /// Adds a views section: opaque query DDL (typically DuckDB `CREATE VIEW`/`CREATE MACRO` text)
+    /// a producer registered via `register_views!`. The text is stored verbatim — the section length
+    /// delimits it, so there is no inner framing — and backbeat never parses it. A producer that
+    /// registers several view sets yields several sections, in registration order; the CLI
+    /// concatenates them after the views it derives from the schema registry.
+    pub fn views(&mut self, sql: &str) {
+        self.sections.push(PendingSection {
+            kind: SectionKind::Views,
+            body: sql.as_bytes().to_vec(),
+        });
+    }
+
     /// Adds a metadata section for one instance: its `instance_id` and an optional host label (pass
     /// `""` for none). A merged dump carries one per merged process.
     pub fn meta(&mut self, instance_id: u64, host: &str) {
@@ -348,6 +362,7 @@ fn put_schema(out: &mut Vec<u8>, s: &EventSchema) {
         put_u16(out, f.width);
         out.push(encode_role(f.role));
         put_opt_str(out, f.unit);
+        put_opt_u64(out, f.sentinel);
         put_u16(out, f.enum_labels.len() as u16);
         for l in f.enum_labels {
             put_u64(out, l.value);
@@ -374,6 +389,7 @@ fn put_owned_schema(out: &mut Vec<u8>, s: &OwnedSchema) {
         put_u16(out, f.width);
         out.push(encode_role(f.role));
         put_opt_str(out, f.unit.as_deref());
+        put_opt_u64(out, f.sentinel);
         put_u16(out, f.enum_labels.len() as u16);
         for l in &f.enum_labels {
             put_u64(out, l.value);
@@ -443,6 +459,15 @@ fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
         Some(s) => {
             out.push(1);
             put_str(out, s);
+        }
+        None => out.push(0),
+    }
+}
+fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        Some(v) => {
+            out.push(1);
+            put_u64(out, v);
         }
         None => out.push(0),
     }
@@ -578,6 +603,21 @@ impl DumpReader {
         Ok(out)
     }
 
+    /// Decodes every views section, one [`String`] per [`Views`](SectionKind::Views) section, in
+    /// file order. Empty if the dump has none. Each is opaque query DDL the producer registered via
+    /// `register_views!`; backbeat does not parse it. A merged dump preserves every input's sets.
+    pub fn views(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for body in self.bodies_of(SectionKind::Views) {
+            out.push(
+                core::str::from_utf8(body)
+                    .map(String::from)
+                    .map_err(|_| Error::InvalidUtf8)?,
+            );
+        }
+        Ok(out)
+    }
+
     /// Decodes every shard section, in file order. Each `region` is a zero-copy [`Bytes`] slice of
     /// the dump buffer — no ring data is copied, however large the dump.
     pub fn shards(&self) -> Result<Vec<ShardData>> {
@@ -634,6 +674,7 @@ fn get_schema(cur: &mut Cursor) -> Result<OwnedSchema> {
         let width = cur.u16()?;
         let role = cur.role()?;
         let unit = cur.opt_str()?;
+        let sentinel = cur.opt_u64()?;
         let label_count = cur.u16()? as usize;
         let mut enum_labels = Vec::with_capacity(label_count.min(cur.remaining()));
         for _ in 0..label_count {
@@ -649,6 +690,7 @@ fn get_schema(cur: &mut Cursor) -> Result<OwnedSchema> {
             width,
             role,
             unit,
+            sentinel,
             enum_labels,
         });
     }
@@ -716,6 +758,14 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    fn opt_u64(&mut self) -> Result<Option<u64>> {
+        if self.u8()? == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(self.u64()?))
+        }
+    }
+
     /// Reads a [`FieldRole`] tag. Unknown tags decode to [`FieldRole::None`] so a dump written by a
     /// newer producer (with roles this build doesn't know) degrades rather than failing.
     fn role(&mut self) -> Result<FieldRole> {
@@ -773,6 +823,7 @@ mod tests {
             width: 8,
             role: FieldRole::Key,
             unit: None,
+            sentinel: Some(u64::MAX),
             enum_labels: &[],
         },
         FieldSchema {
@@ -783,6 +834,7 @@ mod tests {
             width: 1,
             role: FieldRole::None,
             unit: Some("dir"),
+            sentinel: None,
             enum_labels: &[
                 EnumLabel {
                     value: 0,
@@ -815,6 +867,7 @@ mod tests {
             width: 8,
             role: FieldRole::SpanId,
             unit: None,
+            sentinel: None,
             enum_labels: &[],
         },
         FieldSchema {
@@ -825,6 +878,7 @@ mod tests {
             width: 8,
             role: FieldRole::ParentSpanId,
             unit: None,
+            sentinel: None,
             enum_labels: &[],
         },
     ];
@@ -844,13 +898,14 @@ mod tests {
         w.schema_registry([&SCHEMA]);
         w.intern_table(0xDEADBEEF, [(7u32, b"hello".as_slice()), (9, b"world")]);
         w.meta(0xDEADBEEF, "host-7");
+        w.views("CREATE VIEW packets AS SELECT * FROM events;");
         w.shard(0xDEADBEEF, 0, 32, &[0xAA; 64]);
         w.shard(0xDEADBEEF, 3, 8, &[0xBB; 16]);
         let bytes = w.finish();
 
         let r = DumpReader::new(bytes).unwrap();
         assert_eq!(r.flags(), header_flags::LITTLE_ENDIAN);
-        assert_eq!(r.section_count(), 5);
+        assert_eq!(r.section_count(), 6);
 
         // Registry round-trips, descriptions and enum labels included.
         let schemas = r.schemas().unwrap();
@@ -868,6 +923,8 @@ mod tests {
             Some("the packet number")
         );
         assert_eq!(s.fields[0].role, FieldRole::Key);
+        assert_eq!(s.fields[0].sentinel, Some(u64::MAX));
+        assert_eq!(s.fields[1].sentinel, None);
         assert_eq!(s.fields[1].ty, FieldType::Enum { repr: 1 });
         assert_eq!(s.fields[1].unit.as_deref(), Some("dir"));
         assert_eq!(s.fields[1].enum_labels[1].label, "out");
@@ -886,6 +943,10 @@ mod tests {
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].instance_id, 0xDEADBEEF);
         assert_eq!(metas[0].host, "host-7");
+
+        // Views round-trip verbatim.
+        let views = r.views().unwrap();
+        assert_eq!(views, ["CREATE VIEW packets AS SELECT * FROM events;"]);
 
         // Shards round-trip in order, each tagged with its instance.
         let shards = r.shards().unwrap();
@@ -991,6 +1052,24 @@ mod tests {
         assert!(r.schemas().unwrap().is_empty());
         assert!(r.intern_tables().unwrap().is_empty());
         assert!(r.metas().unwrap().is_empty());
+        assert!(r.views().unwrap().is_empty());
         assert!(r.shards().unwrap().is_empty());
+    }
+
+    #[test]
+    fn round_trips_multiple_view_sets() {
+        // Several registered view sets become several sections, preserved in order.
+        let mut w = DumpWriter::new();
+        w.schema_registry([&SCHEMA]);
+        w.views("CREATE VIEW a AS SELECT 1;");
+        w.views("CREATE MACRO m(x) AS TABLE SELECT x;");
+        let r = DumpReader::new(w.finish()).unwrap();
+        assert_eq!(
+            r.views().unwrap(),
+            [
+                "CREATE VIEW a AS SELECT 1;",
+                "CREATE MACRO m(x) AS TABLE SELECT x;"
+            ]
+        );
     }
 }

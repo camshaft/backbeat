@@ -329,19 +329,23 @@ impl<C: Clock> Recorder<C> {
     }
 
     /// Serializes the current state to a `.bb` dump: the schema registry, the given intern-table
-    /// entries, a metadata section (this recorder's `instance_id` plus `host`), and one shard
-    /// section per ring. `schemas` is normally [`crate::registry::schemas()`]; it is a parameter so
-    /// tests (and `no_std`-defined event sets) can supply an explicit registry. Pass `""` for `host`
-    /// if no host label is wanted.
+    /// entries, any query-DDL view sets, a metadata section (this recorder's `instance_id` plus
+    /// `host`), and one shard section per ring. `schemas` is normally [`crate::registry::schemas()`]
+    /// and `views` [`crate::registry::views()`]; both are parameters so tests (and `no_std`-defined
+    /// event sets) can supply explicit values. Pass `""` for `host` if no host label is wanted.
     pub fn dump<'a>(
         &self,
         schemas: impl IntoIterator<Item = &'a crate::schema::EventSchema>,
         intern: impl IntoIterator<Item = (u32, &'a [u8])>,
+        views: impl IntoIterator<Item = &'a str>,
         host: &str,
     ) -> Vec<u8> {
         let mut w = DumpWriter::new();
         w.schema_registry(schemas);
         w.intern_table(self.instance_id, intern);
+        for sql in views {
+            w.views(sql);
+        }
         let mut region = vec![0u8; self.shards.first().map_or(0, |r| r.capacity())];
         for (i, ring) in self.shards.iter().enumerate() {
             // Each ring may differ in capacity in principle; size the scratch to this one.
@@ -397,7 +401,12 @@ mod tests {
         let rec = Recorder::new(1, 4096).with_clock(ManualClock::new(0));
         // No event type needed: a disabled recorder returns before touching the event.
         assert!(!rec.is_enabled());
-        let bytes = rec.dump(core::iter::empty(), core::iter::empty(), "");
+        let bytes = rec.dump(
+            core::iter::empty(),
+            core::iter::empty(),
+            core::iter::empty(),
+            "",
+        );
         let r = DumpReader::new(bytes).unwrap();
         let shards = r.shards().unwrap();
         assert_eq!(shards.len(), 1);
@@ -418,7 +427,12 @@ mod tests {
     #[test]
     fn dump_carries_instance_id() {
         let rec = Recorder::new(1, 4096).with_clock(ManualClock::new(0));
-        let bytes = rec.dump(core::iter::empty(), core::iter::empty(), "host-x");
+        let bytes = rec.dump(
+            core::iter::empty(),
+            core::iter::empty(),
+            core::iter::empty(),
+            "host-x",
+        );
         let metas = DumpReader::new(bytes).unwrap().metas().unwrap();
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].instance_id, rec.instance_id());

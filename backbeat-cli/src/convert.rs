@@ -44,6 +44,13 @@ use std::{
 /// Writes the records of one or more loaded dumps to `output` as one sparse-wide Parquet table.
 /// Returns the total row count. `host` overrides the dumps' host label in the footer when non-empty.
 /// `zstd_level` is the zstd compression level (1–22).
+///
+/// Two side effects beyond the Parquet rows, both carrying the assembled query DDL (Tier-1 views
+/// generated from the registry + the dumps' registered Tier-2 view sets, deduped by content):
+/// the path-independent DDL is embedded in the Parquet footer under key `backbeat.views`, and the
+/// same DDL — prefixed with a bootstrap that binds the base `events` view to this Parquet — is
+/// written to a `<output>.views.sql` sidecar (see [`sidecar_path`]), **overwriting** any existing
+/// file at that path. See [`crate::views`].
 pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) -> Result<usize> {
     // Union the registries across all dumps by event id (schemas with the same id are identical
     // since the id is the fnv1a64 of the layout's qualified name). Sorted for stable column order.
@@ -90,8 +97,43 @@ pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) 
     } else {
         dumps.first().map(|d| d.host.as_str()).unwrap_or("")
     };
-    write_parquet(output, &batch, footer_host, zstd_level)?;
+
+    // Assemble the query DDL: Tier-1 generated from the (unioned) registry + each dump's registered
+    // Tier-2 view set, deduped by content across input files. The path-independent body goes in the
+    // Parquet footer (`backbeat.views`); the sidecar is that prefixed with a bootstrap that binds
+    // the base `events` view to this Parquet, so it is ready to `.read` as-is.
+    let mut seen_views = HashSet::new();
+    let mut tier2: Vec<String> = Vec::new();
+    for d in dumps {
+        for sql in &d.views {
+            if seen_views.insert(sql.clone()) {
+                tier2.push(sql.clone());
+            }
+        }
+    }
+    let ddl = crate::views::assemble(&schemas, &tier2);
+
+    write_parquet(output, &batch, footer_host, zstd_level, &ddl)?;
+
+    // Sidecar `.sql` next to the Parquet: `<output>.views.sql`. Bootstrap + the same DDL. The
+    // bootstrap references the Parquet by file name only (sidecar and Parquet are written together),
+    // so the recommended `duckdb out.parquet -init out.views.sql` works from their directory
+    // regardless of whether `output` was given as a relative or absolute path.
+    let sidecar = sidecar_path(output);
+    let parquet_name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| output.to_string_lossy().into_owned());
+    let sidecar_body = format!("{}{ddl}", crate::views::bootstrap(&parquet_name));
+    std::fs::write(&sidecar, sidecar_body)
+        .with_context(|| format!("writing views sidecar {}", sidecar.display()))?;
+
     Ok(rows.len())
+}
+
+/// The `.views.sql` sidecar path for a Parquet output: `out.parquet` → `out.views.sql`.
+fn sidecar_path(output: &Path) -> std::path::PathBuf {
+    output.with_extension("views.sql")
 }
 
 /// One merged row across all input dumps, borrowing its field bytes and intern table from the
@@ -113,11 +155,25 @@ enum Value {
     Str(String),
 }
 
-/// Decodes a field from a record's field bytes, or `None` if the bytes are too short.
+/// Decodes a field from a record's field bytes, or `None` if the bytes are too short *or* the field
+/// equals its declared sentinel — the producer's in-band "absent" marker — so the column lands as
+/// SQL NULL (see [`OwnedField::sentinel`]). The sentinel compares against the raw little-endian
+/// integer image, matching how it was declared and serialized.
 fn decode_field(field: &OwnedField, bytes: &[u8], intern: &HashMap<u32, String>) -> Option<Value> {
     let start = field.offset as usize;
     let end = start + field.width as usize;
     let slice = bytes.get(start..end)?;
+    // Sentinel → NULL: only meaningful for inline integers ≤ 8 bytes, which is what `read_uint`
+    // reads. A sentinel on a wider/other type simply never matches, so it is a harmless no-op.
+    if let Some(sentinel) = field.sentinel {
+        if field.width as usize <= 8 {
+            if let Some(raw) = read_uint(slice, field.width as usize) {
+                if raw == sentinel {
+                    return None;
+                }
+            }
+        }
+    }
     Some(match field.ty {
         FieldType::U8 => Value::U64(slice[0] as u64),
         FieldType::U16 => Value::U64(u16::from_le_bytes(slice.try_into().ok()?) as u64),
@@ -221,6 +277,11 @@ fn field_metadata(f: &OwnedField) -> HashMap<String, String> {
     }
     if let Some(unit) = &f.unit {
         m.insert("backbeat.unit".to_string(), unit.clone());
+    }
+    if let Some(sentinel) = f.sentinel {
+        // Record the raw "absent" marker so the column stays self-describing even though convert
+        // has already mapped matching values to NULL in the data.
+        m.insert("backbeat.sentinel".to_string(), sentinel.to_string());
     }
     if let Some(desc) = &f.description {
         m.insert("backbeat.description".to_string(), desc.clone());
@@ -454,13 +515,26 @@ fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
 /// semantics (role, unit, span phase, description) ride along as Arrow *field* metadata on the
 /// schema (see [`build_batch`]). Copying the raw shard rings into the footer would roughly double
 /// the file for no gain.
-fn write_parquet(output: &Path, batch: &RecordBatch, host: &str, zstd_level: i32) -> Result<()> {
+fn write_parquet(
+    output: &Path,
+    batch: &RecordBatch,
+    host: &str,
+    zstd_level: i32,
+    ddl: &str,
+) -> Result<()> {
     let mut kv = vec![KeyValue::new(
         "backbeat.format".to_string(),
         "1".to_string(),
     )];
     if !host.is_empty() {
         kv.push(KeyValue::new("backbeat.host".to_string(), host.to_string()));
+    }
+    // The query DDL travels in the footer so the Parquet is self-describing: extract it with
+    // `parquet_kv_metadata()` (DuckDB can't execute footer SQL directly, so it lands in a `.sql`
+    // first — see the `.views.sql` sidecar convert also writes). Path-independent: it references a
+    // base `events` view the reader binds to whatever source.
+    if !ddl.is_empty() {
+        kv.push(KeyValue::new("backbeat.views".to_string(), ddl.to_string()));
     }
     // Trace data is highly repetitive (dictionary-friendly event names, low-cardinality ids,
     // sorted timestamps), so zstd compresses it dramatically.

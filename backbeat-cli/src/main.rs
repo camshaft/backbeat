@@ -12,6 +12,8 @@
 //!   * `inspect <dump>` — print the envelope, schema registry, and per-shard record counts.
 //!   * `convert <dump> [-o out.parquet]` — decode a dump to sparse-wide Parquet using its embedded
 //!     schema, with the registry mirrored into the Parquet footer metadata.
+//!   * `merge <dumps…> -o out.bb` — combine several dumps into one multi-instance `.bb`.
+//!   * `skill` — print a Markdown guide to the CLI and its DuckDB query views.
 
 use anyhow::{bail, Context, Result};
 use backbeat_cli::{convert, inspect, merge, model, trace};
@@ -93,7 +95,13 @@ enum Command {
         /// The `.bb` dump to inspect.
         dump: PathBuf,
     },
+    /// Print a Markdown guide to using this CLI (subcommands, the Parquet table shape, and how to
+    /// load the generated DuckDB views) — a fast ramp-up for an agent or a new user.
+    Skill,
 }
+
+/// The embedded agent/user guide, printed by `backbeat skill`.
+const SKILL: &str = include_str!("skill.md");
 
 /// Infers the output [`Format`] from an explicit flag or the output path's extension.
 fn resolve_format(format: Option<Format>, output: Option<&Path>) -> Result<Format> {
@@ -167,6 +175,10 @@ fn main() -> Result<()> {
                 std::fs::read(&dump).with_context(|| format!("reading dump {}", dump.display()))?;
             inspect::inspect(bytes, &mut std::io::stdout())
                 .with_context(|| format!("inspecting {}", dump.display()))
+        }
+        Command::Skill => {
+            print!("{SKILL}");
+            Ok(())
         }
     }
 }

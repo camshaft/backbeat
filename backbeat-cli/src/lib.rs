@@ -12,9 +12,11 @@
 //! * [`trace`] — write them to Chrome / Perfetto trace JSON, pairing spans into duration slices.
 //! * [`inspect`] — summarize a dump (envelope, registry, per-shard counts).
 //! * [`merge`] — splice several `.bb` dumps into one multi-instance `.bb`.
+//! * [`views`] — generate DuckDB query DDL from a dump's registry + its registered view sets.
 
 pub mod convert;
 pub mod inspect;
 pub mod merge;
 pub mod model;
 pub mod trace;
+pub mod views;

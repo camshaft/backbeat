@@ -54,6 +54,10 @@
 //! Other field attributes (combine with a role):
 //!
 //! * `#[event(unit = "…")]` — attach a unit hint (`"bytes"`, `"ns"`, …) carried into the output.
+//! * `#[event(sentinel = <const>)]` — declare an in-band "absent" marker for an integer field (e.g.
+//!   `sentinel = u64::MAX` for an unassigned packet number, or `sentinel = 0` for a `dump_id` only
+//!   some events carry). The converter maps a field equal to its sentinel to SQL NULL, so the wire
+//!   format needs no nulls yet `WHERE x IS NULL` works.
 //! * `#[event(interned)]` / `#[event(interned(dynamic))]` — the (`u32`) field is an intern id
 //!   resolved against the dump's intern table; `dynamic` marks runtime-built values.
 //!
@@ -254,6 +258,27 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         if matches!(attrs.role, Some(Role::SpanId | Role::ParentSpanId)) {
             require_u64(&field.ty, attrs.role.unwrap())?;
         }
+
+        // `sentinel` is an integer "absent" marker, mapped to NULL by comparing the raw integer
+        // image. It is meaningless on a `bool`, a byte array, or an interned (string) field — reject
+        // the cases the macro can see syntactically so a mistake is a clear compile error rather
+        // than silently nulling valid rows (e.g. a `sentinel = 1` on a `bool` nulling every `true`).
+        if attrs.sentinel.is_some() {
+            if attrs.interned.is_some() {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "`#[event(sentinel = …)]` is not valid on an interned field (it marks an \
+                     absent *integer*, compared against the raw value)",
+                ));
+            }
+            if is_bool(&field.ty) || is_byte_array(&field.ty) {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "`#[event(sentinel = …)]` is only valid on an integer field (the sentinel is \
+                     an in-band absent marker compared against the raw integer value)",
+                ));
+            }
+        }
         match attrs.role {
             Some(Role::SpanId) => span_id_fields += 1,
             Some(Role::ParentSpanId) => parent_span_fields += 1,
@@ -285,6 +310,24 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             Some(r) => r.tokens(),
             None => quote! { ::backbeat::schema::FieldRole::None },
         };
+        // Emit the sentinel as the zero-extended image of the field's stored bytes, which is what
+        // the converter reconstructs with a width-bounded `read_uint`. We (a) cast through the
+        // field's own type so the literal is range-checked and signed values are well-defined, then
+        // (b) widen to `u64` and mask to the field width to STRIP the sign extension that an
+        // `iN as u64` performs. So `#[event(sentinel = -1)] code: i32` yields
+        // `((-1i32) as u64) & 0xFFFF_FFFF` = `0x0000_0000_FFFF_FFFF` — the zero-extension of the 4
+        // on-disk bytes. A full-width `u64::MAX`/`0` masks with `u64::MAX` (the `>= 8` guard avoids
+        // a `1 << 64` overflow). All in `const` context.
+        let sentinel_expr = match &attrs.sentinel {
+            Some(expr) => quote! {
+                ::core::option::Option::Some({
+                    let w = ::core::mem::size_of::<#fty>();
+                    let mask = if w >= 8 { u64::MAX } else { (1u64 << (8 * w)) - 1 };
+                    (((#expr) as #fty) as u64) & mask
+                })
+            },
+            None => quote! { ::core::option::Option::None },
+        };
 
         field_defs.push(quote! {
             ::backbeat::schema::FieldSchema {
@@ -295,6 +338,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 width: ::backbeat::schema::layout_u16(::core::mem::size_of::<#fty>()),
                 role: #role_expr,
                 unit: #unit_expr,
+                sentinel: #sentinel_expr,
                 enum_labels: #labels_expr,
             }
         });
@@ -399,6 +443,10 @@ struct FieldAttrs {
     unit: Option<String>,
     /// `Some(dynamic)` if the field is interned.
     interned: Option<bool>,
+    /// `Some(expr)` if the field declares a `#[event(sentinel = …)]` "absent" marker. The expression
+    /// is emitted as `(expr) as <field type> as u64` so a typed/signed/narrow constant (`u64::MAX`,
+    /// `0`, `-1` on an `i32`, a named const) widens to the same image the converter reads back.
+    sentinel: Option<Expr>,
 }
 
 impl FieldAttrs {
@@ -421,6 +469,11 @@ impl FieldAttrs {
                 } else if meta.path.is_ident("unit") {
                     let lit: LitStr = meta.value()?.parse()?;
                     out.unit = Some(lit.value());
+                    Ok(())
+                } else if meta.path.is_ident("sentinel") {
+                    // `sentinel = <expr>`: an integer constant the producer uses to mean "absent".
+                    let expr: Expr = meta.value()?.parse()?;
+                    out.sentinel = Some(expr);
                     Ok(())
                 } else if meta.path.is_ident("interned") {
                     // `interned` or `interned(dynamic)`.
@@ -502,6 +555,16 @@ impl ContainerAttrs {
         })?;
         Ok(Self { namespace, phase })
     }
+}
+
+/// Whether a field type is the bare `bool` primitive.
+fn is_bool(ty: &Type) -> bool {
+    matches!(ty, Type::Path(p) if p.path.is_ident("bool"))
+}
+
+/// Whether a field type is an array `[_; N]` (e.g. `[u8; 16]` — a `Bytes` field).
+fn is_byte_array(ty: &Type) -> bool {
+    matches!(ty, Type::Array(_))
 }
 
 /// Enforces that a `span_id` / `parent_span_id` field is a bare `u64`.
