@@ -126,6 +126,13 @@ pub struct FieldSchema {
     pub role: FieldRole,
     /// Optional unit hint (`"bytes"`, `"ns"`, …) carried through to the output for tooling.
     pub unit: Option<&'static str>,
+    /// Optional in-band "absent" marker (`#[event(sentinel = …)]`): a field value the producer uses
+    /// to mean "not present" because the wire format has no nulls (e.g. `u64::MAX` for an unassigned
+    /// packet number, or `0` for a `dump_id` only some events carry). Stored as the raw little-endian
+    /// integer reinterpreted as `u64`. The converter maps a field equal to its sentinel to SQL NULL,
+    /// so `WHERE x IS NULL` works without the reader knowing the magic value. Only meaningful for
+    /// fixed-width integer fields (width ≤ 8).
+    pub sentinel: Option<u64>,
     /// Value→label map for [`FieldType::Enum`] fields; empty otherwise.
     pub enum_labels: &'static [EnumLabel],
 }
@@ -216,6 +223,14 @@ impl EventSchema {
             h = h.u16(f.width);
             h = h.byte(f.role as u8);
             h = h.opt_str(f.unit);
+            // Fold the sentinel only when present, so declaring/changing one forks the id (it
+            // changes the field's meaning). The absent case folds *nothing* — `Fnv::byte(0)` is not
+            // a no-op (it still multiplies by the prime), so a field without a sentinel must hash
+            // byte-for-byte as it did before this field existed, keeping every existing event id
+            // stable.
+            if let Some(v) = f.sentinel {
+                h = h.byte(1).u64(v);
+            }
             let mut j = 0;
             while j < f.enum_labels.len() {
                 let l = &f.enum_labels[j];
@@ -263,6 +278,7 @@ mod tests {
                 width: 8,
                 role: FieldRole::Key,
                 unit: None,
+                sentinel: None,
                 enum_labels: &[],
             },
             FieldSchema {
@@ -273,6 +289,7 @@ mod tests {
                 width: 1,
                 role: FieldRole::None,
                 unit: None,
+                sentinel: None,
                 enum_labels: &[
                     EnumLabel {
                         value: 0,
@@ -293,6 +310,57 @@ mod tests {
         assert!(SCHEMA.field("nope").is_none());
         let keys: Vec<_> = SCHEMA.keys().map(|f| f.name).collect();
         assert_eq!(keys, ["packet_number"]);
+    }
+
+    #[test]
+    fn absent_sentinel_does_not_change_id() {
+        // The content-addressed id must be byte-identical whether a field carries `sentinel: None`
+        // or the sentinel concept never existed — otherwise adding the field would have silently
+        // re-keyed every existing event. Pinned golden: the id of this one-`u64`-key event must not
+        // move. If folding the absent sentinel ever stops being a true no-op (e.g. reverting to
+        // `byte(0)` for `None`), this value shifts and the test fails.
+        const FIELDS: &[FieldSchema] = &[FieldSchema {
+            name: "packet_number",
+            description: None,
+            ty: FieldType::U64,
+            offset: 0,
+            width: 8,
+            role: FieldRole::Key,
+            unit: None,
+            sentinel: None,
+            enum_labels: &[],
+        }];
+        let id = EventSchema::compute_id("test::Demo", Phase::None, FIELDS);
+        assert_eq!(id.get(), 0x544e_1269_4249_631b);
+    }
+
+    #[test]
+    fn present_sentinel_forks_id() {
+        const NONE: &[FieldSchema] = &[FieldSchema {
+            name: "x",
+            description: None,
+            ty: FieldType::U64,
+            offset: 0,
+            width: 8,
+            role: FieldRole::None,
+            unit: None,
+            sentinel: None,
+            enum_labels: &[],
+        }];
+        const SOME: &[FieldSchema] = &[FieldSchema {
+            name: "x",
+            description: None,
+            ty: FieldType::U64,
+            offset: 0,
+            width: 8,
+            role: FieldRole::None,
+            unit: None,
+            sentinel: Some(u64::MAX),
+            enum_labels: &[],
+        }];
+        let none = EventSchema::compute_id("n::E", Phase::None, NONE);
+        let some = EventSchema::compute_id("n::E", Phase::None, SOME);
+        assert_ne!(none, some, "declaring a sentinel must fork the id");
     }
 
     #[test]

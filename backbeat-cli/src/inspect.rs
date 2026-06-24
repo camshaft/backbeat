@@ -25,6 +25,7 @@ pub fn inspect(bytes: impl Into<Bytes>, out: &mut impl Write) -> Result<()> {
     let schemas = reader.schemas().map_err(|e| anyhow::anyhow!("{e}"))?;
     let intern = reader.intern_tables().map_err(|e| anyhow::anyhow!("{e}"))?;
     let metas = reader.metas().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let views = reader.views().map_err(|e| anyhow::anyhow!("{e}"))?;
     let shards = reader.shards().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Index schemas by id for record attribution.
@@ -65,13 +66,16 @@ pub fn inspect(bytes: impl Into<Bytes>, out: &mut impl Write) -> Result<()> {
             };
             writeln!(
                 out,
-                "      {}{}: {:?}{}",
+                "      {}{}: {:?}{}{}",
                 marker,
                 f.name,
                 f.ty,
                 f.unit
                     .as_deref()
                     .map(|u| format!(" [{u}]"))
+                    .unwrap_or_default(),
+                f.sentinel
+                    .map(|s| format!(" (sentinel {s})"))
                     .unwrap_or_default()
             )?;
         }
@@ -104,6 +108,26 @@ pub fn inspect(bytes: impl Into<Bytes>, out: &mut impl Write) -> Result<()> {
         "\nintern table: {total_intern} entries across {} instance(s)",
         intern.len()
     )?;
+
+    // Registered query-DDL view sets (consumer SQL, embedded verbatim). Show a one-line summary per
+    // set rather than the full text — `convert` writes the assembled DDL to a `.sql` sidecar.
+    if !views.is_empty() {
+        let total_lines: usize = views.iter().map(|v| v.lines().count()).sum();
+        writeln!(
+            out,
+            "\nview sets ({}, {total_lines} lines of DDL)",
+            views.len()
+        )?;
+        for (i, v) in views.iter().enumerate() {
+            writeln!(
+                out,
+                "  #{}: {} bytes, {} lines",
+                i + 1,
+                v.len(),
+                v.lines().count()
+            )?;
+        }
+    }
 
     // Walk each shard, attributing records to events and counting them. The closure is walk's
     // validator: it accepts (and counts) only records whose event_id is in the registry with a
