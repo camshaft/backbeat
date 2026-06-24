@@ -152,19 +152,34 @@ impl OwnedSchema {
     }
 }
 
-/// Dump-level metadata from the [`Meta`](SectionKind::Meta) section.
+/// Dump-level metadata from a [`Meta`](SectionKind::Meta) section. A dump carries one per instance
+/// it contains — a single-process dump has one; a merged dump has one per merged process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedMeta {
-    /// Random id identifying the process/`Recorder` that produced the dump; the converter keys
-    /// spans by `(instance_id, span_id)`.
+    /// Random id identifying the process/`Recorder` that produced this instance's records; the
+    /// converter keys spans by `(instance_id, span_id)`.
     pub instance_id: u64,
     /// Optional human label for the host/process (empty string if unset).
     pub host: String,
 }
 
-/// One decoded shard section: its id, write head, and raw ring region (see [`crate::ring`]).
+/// One decoded [`Intern`](SectionKind::Intern) section: the instance it belongs to plus its
+/// `id → bytes` entries. Interned ids are per-process, so each is namespaced by `instance_id` to
+/// keep two merged processes' tables from colliding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedIntern {
+    /// The instance whose `Interned` fields these entries resolve.
+    pub instance_id: u64,
+    /// `(id, bytes)` pairs, in file order.
+    pub entries: Vec<(u32, Vec<u8>)>,
+}
+
+/// One decoded shard section: the instance it belongs to, its id, write head, and raw ring region
+/// (see [`crate::ring`]).
 #[derive(Clone, Debug)]
 pub struct ShardData {
+    /// The instance (process) that produced this ring; `0` for a dump with no metadata.
+    pub instance_id: u64,
     pub shard_id: u32,
     pub head: u64,
     pub capacity: u64,
@@ -210,9 +225,35 @@ impl DumpWriter {
         });
     }
 
-    /// Adds the intern table section: `id → bytes`, resolving `Interned` fields at read time.
-    pub fn intern_table<'a>(&mut self, entries: impl IntoIterator<Item = (u32, &'a [u8])>) {
+    /// Adds the schema registry section from already-decoded [`OwnedSchema`]s. Used by `merge` to
+    /// re-emit a registry unioned across input dumps; the serialized form is identical to
+    /// [`schema_registry`](Self::schema_registry), so a re-read round-trips exactly.
+    pub fn schema_registry_owned<'a>(
+        &mut self,
+        schemas: impl IntoIterator<Item = &'a OwnedSchema>,
+    ) {
         let mut body = Vec::new();
+        let schemas: Vec<&OwnedSchema> = schemas.into_iter().collect();
+        put_u32(&mut body, schemas.len() as u32);
+        for s in schemas {
+            put_owned_schema(&mut body, s);
+        }
+        self.sections.push(PendingSection {
+            kind: SectionKind::Schema,
+            body,
+        });
+    }
+
+    /// Adds an intern table section for one instance: `id → bytes`, resolving that instance's
+    /// `Interned` fields at read time. Interned ids are per-process, so the section is namespaced by
+    /// `instance_id` — a merged dump carries one such section per instance, never colliding.
+    pub fn intern_table<'a>(
+        &mut self,
+        instance_id: u64,
+        entries: impl IntoIterator<Item = (u32, &'a [u8])>,
+    ) {
+        let mut body = Vec::new();
+        put_u64(&mut body, instance_id);
         let entries: Vec<(u32, &[u8])> = entries.into_iter().collect();
         put_u32(&mut body, entries.len() as u32);
         for (id, bytes) in entries {
@@ -226,8 +267,8 @@ impl DumpWriter {
         });
     }
 
-    /// Adds the dump-level metadata section: the producing process's `instance_id` and an optional
-    /// host label (pass `""` for none).
+    /// Adds a metadata section for one instance: its `instance_id` and an optional host label (pass
+    /// `""` for none). A merged dump carries one per merged process.
     pub fn meta(&mut self, instance_id: u64, host: &str) {
         let mut body = Vec::new();
         put_u64(&mut body, instance_id);
@@ -238,9 +279,12 @@ impl DumpWriter {
         });
     }
 
-    /// Adds one shard section: its id, write head, and raw ring region (length is its capacity).
-    pub fn shard(&mut self, shard_id: u32, head: u64, region: &[u8]) {
-        let mut body = Vec::with_capacity(20 + region.len());
+    /// Adds one shard section: the instance it belongs to, its id, write head, and raw ring region
+    /// (length is its capacity). The `instance_id` ties the ring to its [`meta`](Self::meta) and
+    /// intern table, so merged dumps keep each process's records and spans separate.
+    pub fn shard(&mut self, instance_id: u64, shard_id: u32, head: u64, region: &[u8]) {
+        let mut body = Vec::with_capacity(28 + region.len());
+        put_u64(&mut body, instance_id);
         put_u32(&mut body, shard_id);
         put_u64(&mut body, head);
         put_u64(&mut body, region.len() as u64);
@@ -249,6 +293,13 @@ impl DumpWriter {
             kind: SectionKind::Shard,
             body,
         });
+    }
+
+    /// Appends an already-serialized section body verbatim under `kind`. Used by `merge` to splice
+    /// instance-tagged Meta/Intern/Shard bodies from input dumps into a combined dump without
+    /// decoding their contents.
+    pub fn raw_section(&mut self, kind: SectionKind, body: Vec<u8>) {
+        self.sections.push(PendingSection { kind, body });
     }
 
     /// Serializes the whole dump: envelope header, section table, then each section body.
@@ -301,6 +352,32 @@ fn put_schema(out: &mut Vec<u8>, s: &EventSchema) {
         for l in f.enum_labels {
             put_u64(out, l.value);
             put_str(out, l.label);
+        }
+    }
+}
+
+/// Serializes one [`OwnedSchema`] into `out`, byte-for-byte identically to [`put_schema`] on the
+/// equivalent borrowed [`EventSchema`]. The inverse of [`get_schema`], used by `merge` to re-emit a
+/// unioned registry.
+fn put_owned_schema(out: &mut Vec<u8>, s: &OwnedSchema) {
+    put_u64(out, s.id.get());
+    put_str(out, &s.qualified_name);
+    put_opt_str(out, s.description.as_deref());
+    put_u16(out, s.record_size);
+    out.push(encode_phase(s.phase));
+    put_u16(out, s.fields.len() as u16);
+    for f in &s.fields {
+        put_str(out, &f.name);
+        put_opt_str(out, f.description.as_deref());
+        put_field_type(out, f.ty);
+        put_u16(out, f.offset);
+        put_u16(out, f.width);
+        out.push(encode_role(f.role));
+        put_opt_str(out, f.unit.as_deref());
+        put_u16(out, f.enum_labels.len() as u16);
+        for l in &f.enum_labels {
+            put_u64(out, l.value);
+            put_str(out, &l.label);
         }
     }
 }
@@ -462,41 +539,50 @@ impl DumpReader {
         Ok(out)
     }
 
-    /// Decodes the intern table into `(id, bytes)` pairs. Empty if the dump has no intern section.
-    pub fn intern_table(&self) -> Result<Vec<(u32, Vec<u8>)>> {
-        let Some(body) = self.bodies_of(SectionKind::Intern).next() else {
-            return Ok(Vec::new());
-        };
-        let mut cur = Cursor::new(body);
-        let count = cur.u32()? as usize;
-        // Clamp the pre-allocation: each entry is ≥8 bytes (id + len), so `remaining()` is a safe
-        // over-estimate that still bounds a forged count to the file size.
-        let mut out = Vec::with_capacity(count.min(cur.remaining()));
-        for _ in 0..count {
-            let id = cur.u32()?;
-            let len = cur.u32()? as usize;
-            out.push((id, cur.take(len)?.to_vec()));
+    /// Decodes every intern table, one [`OwnedIntern`] per [`Intern`](SectionKind::Intern) section,
+    /// in file order. Empty if the dump has no intern section. A single-process dump has one entry;
+    /// a merged dump has one per instance, each namespaced by its `instance_id`.
+    pub fn intern_tables(&self) -> Result<Vec<OwnedIntern>> {
+        let mut tables = Vec::new();
+        for body in self.bodies_of(SectionKind::Intern) {
+            let mut cur = Cursor::new(body);
+            let instance_id = cur.u64()?;
+            let count = cur.u32()? as usize;
+            // Clamp the pre-allocation: each entry is ≥8 bytes (id + len), so `remaining()` is a
+            // safe over-estimate that still bounds a forged count to the file size.
+            let mut entries = Vec::with_capacity(count.min(cur.remaining()));
+            for _ in 0..count {
+                let id = cur.u32()?;
+                let len = cur.u32()? as usize;
+                entries.push((id, cur.take(len)?.to_vec()));
+            }
+            tables.push(OwnedIntern {
+                instance_id,
+                entries,
+            });
         }
-        Ok(out)
+        Ok(tables)
     }
 
-    /// Decodes the dump-level metadata, or `None` if the dump has no [`Meta`](SectionKind::Meta)
-    /// section (e.g. an older dump or one without span/instance info).
-    pub fn meta(&self) -> Result<Option<OwnedMeta>> {
-        let Some(body) = self.bodies_of(SectionKind::Meta).next() else {
-            return Ok(None);
-        };
-        let mut cur = Cursor::new(body);
-        let instance_id = cur.u64()?;
-        let host = cur.str()?;
-        Ok(Some(OwnedMeta { instance_id, host }))
+    /// Decodes every instance's metadata, one [`OwnedMeta`] per [`Meta`](SectionKind::Meta) section,
+    /// in file order. Empty if the dump has no metadata. A single-process dump has one entry; a
+    /// merged dump has one per merged process.
+    pub fn metas(&self) -> Result<Vec<OwnedMeta>> {
+        let mut out = Vec::new();
+        for body in self.bodies_of(SectionKind::Meta) {
+            let mut cur = Cursor::new(body);
+            let instance_id = cur.u64()?;
+            let host = cur.str()?;
+            out.push(OwnedMeta { instance_id, host });
+        }
+        Ok(out)
     }
 
     /// Decodes every shard section, in file order. Each `region` is a zero-copy [`Bytes`] slice of
     /// the dump buffer — no ring data is copied, however large the dump.
     pub fn shards(&self) -> Result<Vec<ShardData>> {
-        // Section body layout: shard_id u32, head u64, capacity u64, then the region.
-        const PREFIX: usize = 4 + 8 + 8;
+        // Section body layout: instance_id u64, shard_id u32, head u64, capacity u64, then region.
+        const PREFIX: usize = 8 + 4 + 8 + 8;
         let mut out = Vec::new();
         for &(kind, off, len) in &self.sections {
             if kind != SectionKind::Shard as u16 {
@@ -504,6 +590,7 @@ impl DumpReader {
             }
             let body = &self.bytes[off..off + len];
             let mut cur = Cursor::new(body);
+            let instance_id = cur.u64()?;
             let shard_id = cur.u32()?;
             let head = cur.u64()?;
             let capacity = cur.u64()? as usize;
@@ -513,6 +600,7 @@ impl DumpReader {
             }
             let region = self.bytes.slice(off + PREFIX..off + PREFIX + capacity);
             out.push(ShardData {
+                instance_id,
                 shard_id,
                 head,
                 capacity: capacity as u64,
@@ -520,6 +608,12 @@ impl DumpReader {
             });
         }
         Ok(out)
+    }
+
+    /// The raw, undecoded body of every section of `kind`, in file order. `merge` uses this to
+    /// splice instance-tagged Meta/Intern/Shard bodies through verbatim.
+    pub fn raw_bodies(&self, kind: SectionKind) -> Vec<Vec<u8>> {
+        self.bodies_of(kind).map(|b| b.to_vec()).collect()
     }
 }
 
@@ -748,10 +842,10 @@ mod tests {
     fn round_trips_a_full_dump() {
         let mut w = DumpWriter::new();
         w.schema_registry([&SCHEMA]);
-        w.intern_table([(7u32, b"hello".as_slice()), (9, b"world")]);
+        w.intern_table(0xDEADBEEF, [(7u32, b"hello".as_slice()), (9, b"world")]);
         w.meta(0xDEADBEEF, "host-7");
-        w.shard(0, 32, &[0xAA; 64]);
-        w.shard(3, 8, &[0xBB; 16]);
+        w.shard(0xDEADBEEF, 0, 32, &[0xAA; 64]);
+        w.shard(0xDEADBEEF, 3, 8, &[0xBB; 16]);
         let bytes = w.finish();
 
         let r = DumpReader::new(bytes).unwrap();
@@ -778,22 +872,72 @@ mod tests {
         assert_eq!(s.fields[1].unit.as_deref(), Some("dir"));
         assert_eq!(s.fields[1].enum_labels[1].label, "out");
 
-        // Intern table round-trips.
-        let intern = r.intern_table().unwrap();
-        assert_eq!(intern, [(7, b"hello".to_vec()), (9, b"world".to_vec())]);
+        // Intern table round-trips, namespaced by instance.
+        let intern = r.intern_tables().unwrap();
+        assert_eq!(intern.len(), 1);
+        assert_eq!(intern[0].instance_id, 0xDEADBEEF);
+        assert_eq!(
+            intern[0].entries,
+            [(7, b"hello".to_vec()), (9, b"world".to_vec())]
+        );
 
         // Meta round-trips.
-        let meta = r.meta().unwrap().unwrap();
-        assert_eq!(meta.instance_id, 0xDEADBEEF);
-        assert_eq!(meta.host, "host-7");
+        let metas = r.metas().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].instance_id, 0xDEADBEEF);
+        assert_eq!(metas[0].host, "host-7");
 
-        // Shards round-trip in order.
+        // Shards round-trip in order, each tagged with its instance.
         let shards = r.shards().unwrap();
         assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].instance_id, 0xDEADBEEF);
         assert_eq!((shards[0].shard_id, shards[0].head), (0, 32));
         assert_eq!(&shards[0].region[..], &[0xAA; 64]);
         assert_eq!((shards[1].shard_id, shards[1].head), (3, 8));
         assert_eq!(shards[1].region.len(), 16);
+    }
+
+    #[test]
+    fn round_trips_multiple_instances() {
+        // A merged dump: one unified registry, but per-instance meta/intern/shard sections. Two
+        // instances reuse intern id 5 for different strings — the namespacing must keep them apart.
+        let mut w = DumpWriter::new();
+        w.schema_registry([&SCHEMA]);
+        w.meta(0xA, "host-a");
+        w.intern_table(0xA, [(5u32, b"alpha".as_slice())]);
+        w.shard(0xA, 0, 16, &[0xAA; 32]);
+        w.meta(0xB, "host-b");
+        w.intern_table(0xB, [(5u32, b"bravo".as_slice())]);
+        w.shard(0xB, 0, 16, &[0xBB; 32]);
+        let bytes = w.finish();
+
+        let r = DumpReader::new(bytes).unwrap();
+        let metas = r.metas().unwrap();
+        assert_eq!(metas.len(), 2);
+        assert_eq!(
+            (metas[0].instance_id, metas[0].host.as_str()),
+            (0xA, "host-a")
+        );
+        assert_eq!(
+            (metas[1].instance_id, metas[1].host.as_str()),
+            (0xB, "host-b")
+        );
+
+        // Same intern id, different instance, different string.
+        let intern = r.intern_tables().unwrap();
+        assert_eq!(intern.len(), 2);
+        assert_eq!(intern[0].instance_id, 0xA);
+        assert_eq!(intern[0].entries, [(5, b"alpha".to_vec())]);
+        assert_eq!(intern[1].instance_id, 0xB);
+        assert_eq!(intern[1].entries, [(5, b"bravo".to_vec())]);
+
+        // Each shard carries its owning instance.
+        let shards = r.shards().unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].instance_id, 0xA);
+        assert_eq!(&shards[0].region[..], &[0xAA; 32]);
+        assert_eq!(shards[1].instance_id, 0xB);
+        assert_eq!(&shards[1].region[..], &[0xBB; 32]);
     }
 
     #[test]
@@ -810,11 +954,11 @@ mod tests {
     }
 
     #[test]
-    fn meta_absent_decodes_to_none() {
+    fn meta_absent_decodes_to_empty() {
         let mut w = DumpWriter::new();
         w.schema_registry([&SCHEMA]);
         let bytes = w.finish();
-        assert!(DumpReader::new(bytes).unwrap().meta().unwrap().is_none());
+        assert!(DumpReader::new(bytes).unwrap().metas().unwrap().is_empty());
     }
 
     #[test]
@@ -845,7 +989,8 @@ mod tests {
         let r = DumpReader::new(bytes).unwrap();
         assert_eq!(r.section_count(), 0);
         assert!(r.schemas().unwrap().is_empty());
-        assert!(r.intern_table().unwrap().is_empty());
+        assert!(r.intern_tables().unwrap().is_empty());
+        assert!(r.metas().unwrap().is_empty());
         assert!(r.shards().unwrap().is_empty());
     }
 }

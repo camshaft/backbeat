@@ -11,8 +11,10 @@
 //! * [`convert`] — write the decoded records to sparse-wide Parquet.
 //! * [`trace`] — write them to Chrome / Perfetto trace JSON, pairing spans into duration slices.
 //! * [`inspect`] — summarize a dump (envelope, registry, per-shard counts).
+//! * [`merge`] — splice several `.bb` dumps into one multi-instance `.bb`.
 
 pub mod convert;
 pub mod inspect;
+pub mod merge;
 pub mod model;
 pub mod trace;

@@ -23,7 +23,8 @@ pub fn inspect(bytes: impl Into<Bytes>, out: &mut impl Write) -> Result<()> {
     let total_len = bytes.len();
     let reader = DumpReader::new(bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
     let schemas = reader.schemas().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let intern = reader.intern_table().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let intern = reader.intern_tables().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let metas = reader.metas().map_err(|e| anyhow::anyhow!("{e}"))?;
     let shards = reader.shards().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Index schemas by id for record attribution.
@@ -77,7 +78,32 @@ pub fn inspect(bytes: impl Into<Bytes>, out: &mut impl Write) -> Result<()> {
     }
     writeln!(out, "  (* = key, $ = span id, ^ = parent span id)")?;
 
-    writeln!(out, "\nintern table: {} entries", intern.len())?;
+    // Instances: a single-process dump has one; a merged dump lists each process it contains.
+    writeln!(out, "\ninstances ({})", metas.len())?;
+    for m in &metas {
+        let n_intern: usize = intern
+            .iter()
+            .filter(|t| t.instance_id == m.instance_id)
+            .map(|t| t.entries.len())
+            .sum();
+        let host = if m.host.is_empty() {
+            "(no host)"
+        } else {
+            m.host.as_str()
+        };
+        writeln!(
+            out,
+            "  {:#018x}  {host}  ({n_intern} intern entries)",
+            m.instance_id
+        )?;
+    }
+
+    let total_intern: usize = intern.iter().map(|t| t.entries.len()).sum();
+    writeln!(
+        out,
+        "\nintern table: {total_intern} entries across {} instance(s)",
+        intern.len()
+    )?;
 
     // Walk each shard, attributing records to events and counting them. The closure is walk's
     // validator: it accepts (and counts) only records whose event_id is in the registry with a
@@ -107,8 +133,8 @@ pub fn inspect(bytes: impl Into<Bytes>, out: &mut impl Write) -> Result<()> {
         total += count;
         writeln!(
             out,
-            "  shard {:>3}: head {:>10}  capacity {:>10}  {} records",
-            shard.shard_id, shard.head, shard.capacity, count
+            "  instance {:#018x}  shard {:>3}: head {:>10}  capacity {:>10}  {} records",
+            shard.instance_id, shard.shard_id, shard.head, shard.capacity, count
         )?;
     }
 

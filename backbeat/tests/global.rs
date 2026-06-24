@@ -57,8 +57,9 @@ fn record_trigger_and_async_dump() {
 
     // The dump must be a valid `.bb` carrying our host label and at least one shard.
     let reader = DumpReader::new(bytes).expect("dump decodes");
-    let meta = reader.meta().unwrap().unwrap();
-    assert_eq!(meta.host, "test-host");
+    let metas = reader.metas().unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].host, "test-host");
     let shards = reader.shards().unwrap();
     assert!(!shards.is_empty());
 

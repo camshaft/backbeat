@@ -20,18 +20,26 @@
 //! │     { id u64, record_size u16, name, fields[] }                       │
 //! │   (the serialized form of crate::schema::EventSchema)                 │
 //! ├─────────────────────────────────────────────────────────────────────┤
-//! │ INTERN table section (optional)                                       │
-//! │   id u32 → bytes  — resolves Interned fields at read time             │
+//! │ INTERN table section(s) (optional) — one per instance                 │
+//! │   { instance_id u64, (id u32 → bytes)* }  — resolves Interned fields  │
 //! ├─────────────────────────────────────────────────────────────────────┤
 //! │ SHARD section(s) — one per capture ring                               │
-//! │   { shard_id u32, head u64, capacity u64, region[capacity] }          │
+//! │   { instance_id u64, shard_id u32, head u64, capacity u64,            │
+//! │     region[capacity] }                                                │
 //! │   the raw ring snapshot; records are `[event_id u64][payload]` walked  │
 //! │   newest-first via the trailing length suffix (see crate::ring)       │
 //! ├─────────────────────────────────────────────────────────────────────┤
-//! │ META section (optional)                                               │
-//! │   { instance_id u64, host label }  — one per process; spans key on it │
+//! │ META section(s) (optional) — one per instance                         │
+//! │   { instance_id u64, host label }  — spans key on (instance_id, …)    │
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! The format is inherently **multi-instance**: Meta, Intern, and Shard sections are each tagged
+//! with the `instance_id` of the process that produced them, while the schema registry is unified
+//! (content-addressed by [`EventId`](crate::id::EventId)). A single-process dump carries one Meta,
+//! one Intern table, and its shards; `backbeat merge` splices several dumps into one by unioning the
+//! registries and copying every instance's tagged sections through verbatim — so a merged dump
+//! reconstructs each process's records and spans exactly as the source dumps would.
 //!
 //! Crucially, `FORMAT_VERSION` governs only the *envelope and section framing* — event layouts
 //! evolve freely because each is described by its own schema in the registry. There is no

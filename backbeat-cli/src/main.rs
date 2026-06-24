@@ -14,7 +14,7 @@
 //!     schema, with the registry mirrored into the Parquet footer metadata.
 
 use anyhow::{bail, Context, Result};
-use backbeat_cli::{convert, inspect, model, trace};
+use backbeat_cli::{convert, inspect, merge, model, trace};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 
@@ -67,6 +67,26 @@ enum Command {
         /// zstd compression level for Parquet output (1–22).
         #[arg(long, default_value_t = 3)]
         compression_level: i32,
+    },
+    /// Combine several `.bb` dumps into one multi-instance `.bb`.
+    ///
+    /// By default the records are decoded, de-duplicated (overlapping dumps re-capture shared ring
+    /// contents), and re-packed into compact shards — the smallest faithful dump. Pass `--no-dedup`
+    /// for a cheap raw splice that copies every input's sections through verbatim (keeping
+    /// duplicates) — handy for concatenating a host's dumps for upload, since `convert` dedups on
+    /// the way out regardless. Either way schemas are unioned by id and instance ids are preserved,
+    /// so converting the merged file yields exactly what converting the inputs together would.
+    Merge {
+        /// The `.bb` dumps to merge. Two or more are required.
+        #[arg(required = true, num_args = 2..)]
+        dumps: Vec<PathBuf>,
+        /// Output path for the merged `.bb`.
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        /// Skip de-duplication: splice the inputs' sections through verbatim (faster, but keeps
+        /// duplicate records from overlapping dumps).
+        #[arg(long)]
+        no_dedup: bool,
     },
     /// Print the envelope, schema registry, and per-shard record counts.
     Inspect {
@@ -123,6 +143,20 @@ fn main() -> Result<()> {
             };
             println!(
                 "wrote {count} {what} from {} dump(s) to {}",
+                dumps.len(),
+                output.display()
+            );
+            Ok(())
+        }
+        Command::Merge {
+            dumps,
+            output,
+            no_dedup,
+        } => {
+            let schemas = merge::merge(&dumps, &output, !no_dedup)?;
+            let how = if no_dedup { "spliced" } else { "merged" };
+            println!(
+                "{how} {} dump(s) into {} ({schemas} event schema(s))",
                 dumps.len(),
                 output.display()
             );

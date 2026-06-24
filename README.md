@@ -73,12 +73,32 @@ Then read the dump with the CLI:
 
 ```console
 $ cargo install backbeat-cli
-$ backbeat inspect trace.bb              # envelope, schema registry, per-shard counts
+$ backbeat inspect trace.bb              # envelope, schema registry, per-instance + per-shard counts
 $ backbeat convert trace.bb -o out.parquet   # → sparse-wide Parquet
 $ backbeat convert trace.bb -o out.json      # → Chrome / Perfetto trace
+$ backbeat merge a.bb b.bb -o all.bb         # → one multi-instance .bb
 ```
 
-`convert` accepts multiple dumps and merges them into one output.
+`convert` accepts multiple dumps and merges them into one output, de-duplicating records that
+overlapping dumps captured more than once (successive dumps of one process share a ring, so the
+newer one re-contains the older's tail).
+
+### Merging dumps
+
+A `.bb` is inherently multi-instance: metadata, intern tables, and shard rings are each tagged with
+the `instance_id` of the process that produced them, while the schema registry is unified
+(content-addressed by event id). `backbeat merge` combines several dumps — from one process over
+time, or many processes across a fleet — into a single file:
+
+```console
+$ backbeat merge run.*.bb -o combined.bb            # decode, de-duplicate, re-pack compact shards
+$ backbeat merge host.*.bb -o upload.bb --no-dedup  # cheap raw splice (keeps duplicates)
+```
+
+By default `merge` trims the result to one record per distinct event. `--no-dedup` is a fast,
+lossless byte-splice — useful for concatenating a host's dumps before upload, since `convert` dedups
+on the way out regardless. Converting a merged file yields exactly what converting its inputs
+together would.
 
 ## Global recorder
 

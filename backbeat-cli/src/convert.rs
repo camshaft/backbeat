@@ -18,7 +18,7 @@
 //! dump's `instance_id`/`host` go in the footer key-value metadata — so the Parquet is
 //! self-describing without copying the (potentially large) raw dump into it.
 
-use crate::model::Loaded;
+use crate::model::{self, Loaded};
 use anyhow::{Context, Result};
 use arrow::{
     array::{ArrayRef, BooleanBuilder, Int64Builder, StringBuilder, StructArray, UInt64Builder},
@@ -63,24 +63,23 @@ pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) 
         .map(|(i, s)| (s.id.get(), i))
         .collect();
 
-    // Flatten every dump's records into merged rows, tagged with their source instance_id, and sort
-    // into the global order `(ts_nanos, instance_id, shard_id, local_seq)`.
-    let mut rows: Vec<Row> = Vec::new();
-    for d in dumps {
-        for r in &d.records {
+    // Flatten every dump's records into merged rows, tagged with their source instance_id.
+    // `unique_records` already returns them in the global order `(ts_nanos, instance_id, shard_id,
+    // …)` with duplicates (the same logged event re-captured by overlapping dumps) dropped, so a
+    // merged or multi-input conversion never double-counts and needs no further sort.
+    let rows: Vec<Row> = model::unique_records(dumps)
+        .into_iter()
+        .map(|(d, r)| {
             let id = d.schemas[r.schema_idx].id.get();
-            rows.push(Row {
+            Row {
                 ts_nanos: r.ts_nanos,
                 instance_id: d.instance_id,
-                shard_id: r.shard_id,
-                local_seq: r.local_seq,
                 schema_idx: by_id[&id],
                 fields: &r.fields,
                 intern: &d.intern,
-            });
-        }
-    }
-    rows.sort_by_key(|r| (r.ts_nanos, r.instance_id, r.shard_id, r.local_seq));
+            }
+        })
+        .collect();
 
     let batch = build_batch(&schemas, &rows)?;
 
@@ -100,8 +99,6 @@ pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) 
 struct Row<'a> {
     ts_nanos: u64,
     instance_id: u64,
-    shard_id: u32,
-    local_seq: u64,
     /// Index into the unioned `schemas`.
     schema_idx: usize,
     fields: &'a [u8],

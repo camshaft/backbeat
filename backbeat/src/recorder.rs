@@ -341,7 +341,7 @@ impl<C: Clock> Recorder<C> {
     ) -> Vec<u8> {
         let mut w = DumpWriter::new();
         w.schema_registry(schemas);
-        w.intern_table(intern);
+        w.intern_table(self.instance_id, intern);
         let mut region = vec![0u8; self.shards.first().map_or(0, |r| r.capacity())];
         for (i, ring) in self.shards.iter().enumerate() {
             // Each ring may differ in capacity in principle; size the scratch to this one.
@@ -349,7 +349,7 @@ impl<C: Clock> Recorder<C> {
                 region = vec![0u8; ring.capacity()];
             }
             let head = ring.snapshot_into(&mut region);
-            w.shard(i as u32, head as u64, &region);
+            w.shard(self.instance_id, i as u32, head as u64, &region);
         }
         w.meta(self.instance_id, host);
         w.finish()
@@ -419,9 +419,10 @@ mod tests {
     fn dump_carries_instance_id() {
         let rec = Recorder::new(1, 4096).with_clock(ManualClock::new(0));
         let bytes = rec.dump(core::iter::empty(), core::iter::empty(), "host-x");
-        let meta = DumpReader::new(bytes).unwrap().meta().unwrap().unwrap();
-        assert_eq!(meta.instance_id, rec.instance_id());
-        assert_eq!(meta.host, "host-x");
+        let metas = DumpReader::new(bytes).unwrap().metas().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].instance_id, rec.instance_id());
+        assert_eq!(metas[0].host, "host-x");
     }
 
     #[test]

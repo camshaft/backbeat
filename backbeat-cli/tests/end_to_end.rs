@@ -266,7 +266,7 @@ fn convert_writes_readable_parquet() {
     let path = dir.join("out.parquet");
 
     let loaded = backbeat_cli::model::load(std::path::Path::new("in.bb"), bytes.into()).unwrap();
-    let rows = backbeat_cli::convert::to_parquet(&[loaded], &path, "", 3).unwrap();
+    let rows = backbeat_cli::convert::to_parquet(&loaded, &path, "", 3).unwrap();
     assert_eq!(rows, 3);
 
     // Read it back with the parquet reader.
@@ -368,7 +368,7 @@ fn convert_writes_chrome_trace_json() {
     let path = dir.join("trace.json");
 
     let loaded = backbeat_cli::model::load(std::path::Path::new("in.bb"), bytes.into()).unwrap();
-    let n = backbeat_cli::trace::to_trace(&[loaded], &path).unwrap();
+    let n = backbeat_cli::trace::to_trace(&loaded, &path).unwrap();
     assert!(n >= 2, "expected at least the enter/exit pair, got {n}");
 
     let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -400,17 +400,159 @@ fn convert_merges_multiple_dumps() {
     // Two independent dumps (distinct instance_ids) merge into one Parquet, rows keyed per-dump.
     let d1 = dump_with_three_records();
     let d2 = dump_with_three_records();
-    let l1 = backbeat_cli::model::load(std::path::Path::new("a.bb"), d1.into()).unwrap();
-    let l2 = backbeat_cli::model::load(std::path::Path::new("b.bb"), d2.into()).unwrap();
+    let mut l1 = backbeat_cli::model::load(std::path::Path::new("a.bb"), d1.into()).unwrap();
+    let mut l2 = backbeat_cli::model::load(std::path::Path::new("b.bb"), d2.into()).unwrap();
+    // Each single-process dump loads as exactly one instance, with its own random instance_id.
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l2.len(), 1);
     assert_ne!(
-        l1.instance_id, l2.instance_id,
+        l1[0].instance_id, l2[0].instance_id,
         "each Recorder gets its own instance_id"
     );
 
     let dir = std::env::temp_dir().join("backbeat_e2e_test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("merged.parquet");
-    let rows = backbeat_cli::convert::to_parquet(&[l1, l2], &path, "", 3).unwrap();
+    let loaded = vec![l1.remove(0), l2.remove(0)];
+    let rows = backbeat_cli::convert::to_parquet(&loaded, &path, "", 3).unwrap();
     assert_eq!(rows, 6, "both dumps' records present");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn merge_then_convert_equals_convert_both() {
+    // Merging two dumps into one `.bb` and converting that must yield exactly what converting the
+    // two source dumps together does: same instances, same intern tables, same row count.
+    let dir = std::env::temp_dir().join("backbeat_e2e_merge");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.bb");
+    let b = dir.join("b.bb");
+    std::fs::write(&a, dump_with_three_records()).unwrap();
+    std::fs::write(&b, dump_with_three_records()).unwrap();
+
+    // Merge into one multi-instance file.
+    let merged = dir.join("merged.bb");
+    let schemas = backbeat_cli::merge::merge(&[a.clone(), b.clone()], &merged, true).unwrap();
+    assert!(schemas >= 2, "registry unions both events");
+
+    // The merged file decodes to two instances — exactly what loading the sources separately gives.
+    let from_merged =
+        backbeat_cli::model::load(&merged, std::fs::read(&merged).unwrap().into()).unwrap();
+    assert_eq!(from_merged.len(), 2, "two instances in the merged dump");
+
+    let separate = backbeat_cli::model::load_many(&[a.clone(), b.clone()]).unwrap();
+    assert_eq!(separate.len(), 2);
+
+    // Same set of instance_ids, same per-instance record counts (order-independent).
+    let mut merged_ids: Vec<u64> = from_merged.iter().map(|l| l.instance_id).collect();
+    let mut sep_ids: Vec<u64> = separate.iter().map(|l| l.instance_id).collect();
+    merged_ids.sort_unstable();
+    sep_ids.sort_unstable();
+    assert_eq!(merged_ids, sep_ids);
+    for l in &from_merged {
+        assert_eq!(l.records.len(), 3, "each instance keeps its three records");
+    }
+
+    // Converting the merged file produces the same number of rows as converting both sources.
+    let p_merged = dir.join("from_merged.parquet");
+    let p_separate = dir.join("from_separate.parquet");
+    let r_merged = backbeat_cli::convert::to_parquet(&from_merged, &p_merged, "", 3).unwrap();
+    let r_separate = backbeat_cli::convert::to_parquet(&separate, &p_separate, "", 3).unwrap();
+    assert_eq!(r_merged, r_separate);
+    assert_eq!(r_merged, 6);
+
+    for f in [&a, &b, &merged, &p_merged, &p_separate] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// Two overlapping snapshots of the *same* recorder: the second dump re-contains the first's
+/// records (a real merge scenario — successive dumps share the ring). Merging must collapse the
+/// overlap to one row per distinct event; `--no-dedup` must keep the duplicates.
+#[test]
+fn merge_dedups_overlapping_dumps_of_one_recorder() {
+    let clock = Arc::new(ManualClock::new(1000));
+    let rec = Recorder::new(1, 64 * 1024).with_clock(clock.clone());
+    rec.set_enabled(true);
+    let schemas: Vec<_> = backbeat::registry::schemas().collect();
+
+    // First snapshot: three packets.
+    for n in 0..3u64 {
+        rec.record(&PacketSent {
+            conn_id: 1,
+            packet_number: n,
+            len: 100,
+            is_fin: false,
+            _pad: [0; 3],
+        });
+        clock.advance(10);
+    }
+    let d1 = rec.dump(schemas.iter().copied(), std::iter::empty(), "");
+
+    // Three more, then a second snapshot — which still holds all six (the ring is large).
+    for n in 3..6u64 {
+        rec.record(&PacketSent {
+            conn_id: 1,
+            packet_number: n,
+            len: 100,
+            is_fin: false,
+            _pad: [0; 3],
+        });
+        clock.advance(10);
+    }
+    let d2 = rec.dump(schemas.iter().copied(), std::iter::empty(), "");
+
+    let dir = std::env::temp_dir().join("backbeat_e2e_dedup");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("d1.bb");
+    let b = dir.join("d2.bb");
+    std::fs::write(&a, &d1).unwrap();
+    std::fs::write(&b, &d2).unwrap();
+
+    // d2 alone holds all six; d1 holds the first three — so the raw set is nine, six distinct.
+    let raw = backbeat_cli::model::load_many(&[a.clone(), b.clone()]).unwrap();
+    let raw_total: usize = raw.iter().map(|l| l.records.len()).sum();
+    assert_eq!(
+        raw_total, 9,
+        "both dumps overlap on the first three records"
+    );
+    assert_eq!(
+        backbeat_cli::model::unique_records(&raw).len(),
+        6,
+        "six distinct events after dedup"
+    );
+
+    // Default merge dedups + trims: the merged file decodes to exactly six records.
+    let merged = dir.join("merged.bb");
+    backbeat_cli::merge::merge(&[a.clone(), b.clone()], &merged, true).unwrap();
+    let from_merged =
+        backbeat_cli::model::load(&merged, std::fs::read(&merged).unwrap().into()).unwrap();
+    assert_eq!(from_merged.len(), 1, "one instance");
+    assert_eq!(
+        from_merged[0].records.len(),
+        6,
+        "merge trimmed the three duplicates"
+    );
+    // The packet numbers 0..6 are all present and unique.
+    let mut nums: Vec<u64> = from_merged[0]
+        .records
+        .iter()
+        .map(|r| u64::from_le_bytes(r.fields[8..16].try_into().unwrap()))
+        .collect();
+    nums.sort_unstable();
+    assert_eq!(nums, vec![0, 1, 2, 3, 4, 5]);
+
+    // --no-dedup keeps the raw overlap: nine records spliced through.
+    let spliced = dir.join("spliced.bb");
+    backbeat_cli::merge::merge(&[a.clone(), b.clone()], &spliced, false).unwrap();
+    let from_spliced =
+        backbeat_cli::model::load(&spliced, std::fs::read(&spliced).unwrap().into()).unwrap();
+    let spliced_total: usize = from_spliced.iter().map(|l| l.records.len()).sum();
+    assert_eq!(spliced_total, 9, "splice keeps duplicates");
+    // But convert still dedups on the way out.
+    assert_eq!(backbeat_cli::model::unique_records(&from_spliced).len(), 6);
+
+    for f in [&a, &b, &merged, &spliced] {
+        let _ = std::fs::remove_file(f);
+    }
 }
