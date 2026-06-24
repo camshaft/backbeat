@@ -1,6 +1,6 @@
 [package]
 name = "backbeat-macros"
-version = "0.1.1"
+version = "0.1.2"
 description = "Derive macro for backbeat: annotate any struct as a traceable event"
 authors.workspace = true
 repository.workspace = true
