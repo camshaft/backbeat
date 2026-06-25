@@ -159,21 +159,31 @@ pub struct MergedRec<'a> {
     pub fields: Bytes,
 }
 
-/// The full ordering/identity key of a record: `(ts_nanos, instance_id, shard_id, offset)`. These
-/// four values *are* a record's true identity — the ring is a bump allocator over a monotonic
-/// cursor (see [`backbeat::ring`]), so a record lands at one fixed offset in its `(instance_id,
-/// shard_id)` ring for the recorder's whole life. Two overlapping dumps that re-capture the same
-/// logged event therefore reproduce the identical offset, making their keys equal; [`merge_records`]
-/// drops the duplicate with an equality check against the previously emitted key — no hash set.
-/// Sorting by this key also yields the global converter order.
+/// The ordering/identity key of a record: `(ts_nanos, instance_id, shard_id, offset)`. Sorting by it
+/// yields the global converter order, and equal keys mark duplicates — the same logged event
+/// re-captured by two overlapping dumps of one recorder — which [`merge_records`] drops with an
+/// equality check against the previously emitted key (no hash set).
 ///
-/// `event_id` and `fields` are deliberately absent — comparing the variable-length field bytes was
-/// the dominant cost of both the per-shard sort and the merge, and the offset already pins identity:
-/// within one dump's snapshot a physical offset belongs to at most one walked record, and across
-/// dumps a shared physical slot implies a full ring-cycle (`capacity` bytes) gap in absolute offset,
-/// hence a different `ts_nanos`. So `(ts_nanos, offset)` separates distinct records within a shard
-/// without ever touching their bytes. `local_seq` is likewise absent: it is assigned per-walk, so
-/// the same event gets different seqs in two dumps and could never match.
+/// `event_id` and `fields` are deliberately absent: comparing the variable-length field bytes was
+/// the dominant cost of both the per-shard sort and the merge, and `(ts_nanos, offset)` already
+/// separates distinct records within a shard. `local_seq` is absent for a different reason — it is
+/// assigned per-walk, so the same event gets different seqs in two dumps and could never match.
+///
+/// ## Why `(ts_nanos, offset)` is an identity — and its one assumption
+///
+/// `offset` is [`Locator::offset`]: the *physical* byte position of the record in its ring region,
+/// i.e. its absolute write position **modulo `capacity`** (see [`backbeat::ring`]; the ring is a
+/// bump allocator over a monotonic cursor, masked down to a physical index). Within a single dump's
+/// snapshot a physical offset belongs to at most one walked record, so offset alone disambiguates
+/// there. Across two dumps it is not unique on its own: a physical slot is **reused once per ring
+/// cycle**, so a record in dump A and a *different* record `capacity` bytes later in dump B can share
+/// an offset. `ts_nanos` is what separates those two — and it does so **provided the clock advances
+/// at least once per full ring cycle** (one whole `capacity`-worth of records). That holds for any
+/// real wall/monotonic clock at realistic ring sizes: a cycle is millions of records (e.g. ~6.4M for
+/// a 256 MiB shard of 42-byte records), far longer than any clock stalls. It can be *violated* only
+/// by a clock that stays constant across a whole cycle — e.g. a [`ManualClock`](backbeat::recorder)
+/// pinned to one value in a test — in which case two distinct same-offset records would mis-dedup.
+/// No production clock can do that.
 ///
 /// (The at-most-one boundary-wrapping record per shard carries the [`WRAPPED`] sentinel offset; it
 /// is consistent across dumps — whether a record straddles the physical boundary depends only on its
@@ -355,8 +365,9 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     /// The merge key of the locator at the cursor's current position (`None` if exhausted). Built
-    /// from the locator's `(ts_nanos, offset)` alone — no schema lookup, no field slice — since the
-    /// offset already identifies the record within its shard (see [`Key`]).
+    /// from the locator's `(ts_nanos, offset)` alone — no schema lookup, no field slice. See [`Key`]
+    /// for why that pair identifies a record across dumps and the clock-resolution assumption it
+    /// rests on (offset is a physical, per-cycle-reused ring position, disambiguated by `ts_nanos`).
     fn key(&self) -> Option<Key> {
         let loc = self.shard.locs.get(self.pos)?;
         Some(Key {
