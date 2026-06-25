@@ -509,8 +509,12 @@ pub fn load_many(paths: &[PathBuf]) -> Result<Vec<Loaded>> {
 /// Memory-maps a dump file into a [`Bytes`], so a multi-gigabyte dump is demand-paged by the OS
 /// rather than read into the heap up front. The records the converters hold are zero-copy slices of
 /// this mapping (see [`load`]), so only the pages actually touched are resident, and the kernel can
-/// evict clean pages under memory pressure. Falls back to a plain read for the empty file (mmap of a
-/// zero-length file is an error on some platforms) — an empty dump simply has no records.
+/// evict clean pages under memory pressure.
+///
+/// A zero-length file maps to empty bytes (some platforms reject `mmap` of an empty file, so we
+/// skip the syscall). That is not a valid dump — it has no envelope — so the caller's
+/// [`DumpReader::new`] then rejects it with a clear "bad magic"/"unexpected EOF" error, exactly as
+/// a truncated dump would.
 pub fn map_dump(path: &Path) -> Result<Bytes> {
     let file = fs::File::open(path).with_context(|| format!("opening dump {}", path.display()))?;
     let len = file
@@ -527,7 +531,8 @@ pub fn map_dump(path: &Path) -> Result<Bytes> {
         memmap2::Mmap::map(&file).with_context(|| format!("mmapping dump {}", path.display()))?
     };
     // Advise the kernel we'll stream the mapping roughly sequentially (the shard walks scan their
-    // regions); best-effort, ignored where unsupported.
+    // regions); best-effort, ignored where unsupported. `advise` is Unix-only in memmap2.
+    #[cfg(unix)]
     let _ = mmap.advise(memmap2::Advice::Sequential);
     Ok(Bytes::from_owner(mmap))
 }
