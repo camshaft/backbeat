@@ -120,7 +120,9 @@ jobs:
       fail-fast: false
       matrix:
         rust: ${{ fromJson(needs.env.outputs.rust-versions) }}
-        os: [ubuntu-latest, macOS-latest, windows-latest]
+        # Linux + macOS only — the same platforms we ship release binaries for (see release.yml:
+        # x86_64/aarch64 musl + aarch64 macOS). Windows is not a supported target.
+        os: [ubuntu-latest, macOS-latest]
     steps:
       - uses: actions/checkout@v7
 

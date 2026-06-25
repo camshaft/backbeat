@@ -236,6 +236,24 @@ impl Ring {
 /// the physical ring boundary — its bytes aren't contiguous, so it is reconstructed into a fresh
 /// `Bytes`. Callers may cheaply clone the payload to retain it.
 pub fn walk(region: &Bytes, head: usize, capacity: usize, mut f: impl FnMut(Bytes) -> bool) {
+    walk_indexed(region, head, capacity, |payload, _| f(payload));
+}
+
+/// Like [`walk`], but the callback also learns *where* each record's payload lives within `region`:
+/// `Some(physical_offset)` when the record is a contiguous slice of `region` beginning at that byte
+/// offset (the common case), or `None` for the at-most-one record per ring that wraps the physical
+/// boundary and was therefore reconstructed into a fresh buffer.
+///
+/// This lets a reader keep a compact `(offset, len)` locator per record instead of retaining a
+/// 32-byte [`Bytes`] handle each — the difference between a few hundred MiB and several GiB of
+/// per-record bookkeeping on a dump with hundreds of millions of records. The yielded `Bytes` is
+/// still the payload (so the callback can validate it); the offset is purely additional.
+pub fn walk_indexed(
+    region: &Bytes,
+    head: usize,
+    capacity: usize,
+    mut f: impl FnMut(Bytes, Option<usize>) -> bool,
+) {
     if region.len() != capacity || !capacity.is_power_of_two() {
         return;
     }
@@ -269,17 +287,18 @@ pub fn walk(region: &Bytes, head: usize, capacity: usize, mut f: impl FnMut(Byte
         let payload_start = abs - rec_total;
         let begin = payload_start & mask;
 
-        // Contiguous record → zero-copy slice of `region`. Only the one record that wraps the
-        // physical boundary needs reconstruction into a fresh `Bytes`.
-        let payload = if begin + payload_len <= capacity {
-            region.slice(begin..begin + payload_len)
+        // Contiguous record → zero-copy slice of `region`, and we can report its physical offset.
+        // Only the one record that wraps the physical boundary needs reconstruction into a fresh
+        // `Bytes`, and has no single contiguous offset (so the callback gets `None`).
+        let (payload, phys) = if begin + payload_len <= capacity {
+            (region.slice(begin..begin + payload_len), Some(begin))
         } else {
             let mut buf = alloc::vec![0u8; payload_len];
             read_wrapping(payload_start, payload_len, &mut buf);
-            Bytes::from(buf)
+            (Bytes::from(buf), None)
         };
 
-        if f(payload) {
+        if f(payload, phys) {
             // Accepted: the record occupies `[payload_start, abs)`; continue behind it.
             abs = payload_start;
         } else {

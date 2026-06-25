@@ -70,26 +70,6 @@ pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) 
         .map(|(i, s)| (s.id.get(), i))
         .collect();
 
-    // Flatten every dump's records into merged rows, tagged with their source instance_id.
-    // `unique_records` already returns them in the global order `(ts_nanos, instance_id, shard_id,
-    // …)` with duplicates (the same logged event re-captured by overlapping dumps) dropped, so a
-    // merged or multi-input conversion never double-counts and needs no further sort.
-    let rows: Vec<Row> = model::unique_records(dumps)
-        .into_iter()
-        .map(|(d, r)| {
-            let id = d.schemas[r.schema_idx].id.get();
-            Row {
-                ts_nanos: r.ts_nanos,
-                instance_id: d.instance_id,
-                schema_idx: by_id[&id],
-                fields: &r.fields,
-                intern: &d.intern,
-            }
-        })
-        .collect();
-
-    let batch = build_batch(&schemas, &rows)?;
-
     // Footer metadata: a host override wins; else the first dump's host. instance_id is per-row, so
     // it is a column, not footer metadata, once dumps are merged.
     let footer_host = if !host.is_empty() {
@@ -113,7 +93,39 @@ pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) 
     }
     let ddl = crate::views::assemble(&schemas, &tier2);
 
-    write_parquet(output, &batch, footer_host, zstd_level, &ddl)?;
+    // Stream the output: pull the globally-ordered, de-duplicated records from the lazy k-way merge
+    // (see [`model::merge_records`]) and flush a Parquet row group every `ROW_GROUP_ROWS`. This is
+    // the whole point of the rework — converting an N-record dump never holds N records or N rows in
+    // memory at once, only the current chunk + the merge's per-shard cursors. It also caps Arrow
+    // builder memory at ~one row group and keeps every Arrow string column under its 2 GiB
+    // i32-offset limit (a whole-dump `event` name column alone overflows it past ~a few hundred
+    // million rows). See [`ROW_GROUP_ROWS`].
+    let plan = plan_columns(&schemas);
+    let mut writer = open_writer(output, plan.schema.clone(), footer_host, zstd_level, &ddl)?;
+    let mut total: usize = 0;
+    let mut chunk: Vec<Row> = Vec::with_capacity(ROW_GROUP_ROWS);
+    for rec in model::merge_records(dumps) {
+        let id = rec.loaded.schemas[rec.schema_idx].id.get();
+        chunk.push(Row {
+            ts_nanos: rec.ts_nanos,
+            instance_id: rec.loaded.instance_id,
+            schema_idx: by_id[&id],
+            fields: rec.fields,
+            intern: &rec.loaded.intern,
+        });
+        if chunk.len() == ROW_GROUP_ROWS {
+            let batch = build_chunk(&plan, &schemas, &chunk, total as u64)?;
+            writer.write(&batch).context("writing Parquet row group")?;
+            total += chunk.len();
+            chunk.clear();
+        }
+    }
+    if !chunk.is_empty() {
+        let batch = build_chunk(&plan, &schemas, &chunk, total as u64)?;
+        writer.write(&batch).context("writing Parquet row group")?;
+        total += chunk.len();
+    }
+    writer.close().context("closing Parquet writer")?;
 
     // Sidecar `.sql` next to the Parquet: `<output>.views.sql`. Bootstrap + the same DDL. The
     // bootstrap references the Parquet by file name only (sidecar and Parquet are written together),
@@ -128,7 +140,7 @@ pub fn to_parquet(dumps: &[Loaded], output: &Path, host: &str, zstd_level: i32) 
     std::fs::write(&sidecar, sidecar_body)
         .with_context(|| format!("writing views sidecar {}", sidecar.display()))?;
 
-    Ok(rows.len())
+    Ok(total)
 }
 
 /// The `.views.sql` sidecar path for a Parquet output: `out.parquet` → `out.views.sql`.
@@ -136,14 +148,14 @@ fn sidecar_path(output: &Path) -> std::path::PathBuf {
     output.with_extension("views.sql")
 }
 
-/// One merged row across all input dumps, borrowing its field bytes and intern table from the
-/// owning [`Loaded`].
+/// One merged row across all input dumps: its field bytes (a zero-copy refcounted slice of the dump
+/// mmap) and a borrow of the owning [`Loaded`]'s intern table.
 struct Row<'a> {
     ts_nanos: u64,
     instance_id: u64,
     /// Index into the unioned `schemas`.
     schema_idx: usize,
-    fields: &'a [u8],
+    fields: bytes::Bytes,
     intern: &'a HashMap<u32, String>,
 }
 
@@ -356,14 +368,36 @@ impl Col {
     }
 }
 
-/// Builds the sparse-wide [`RecordBatch`] from the merged rows.
-fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
+/// How many rows go into each streamed Parquet row group. The whole output is written as a sequence
+/// of batches of this size rather than one giant `RecordBatch`, which (a) caps Arrow builder memory
+/// at roughly one row group regardless of dump size, and (b) keeps every Arrow string column under
+/// its 2 GiB i32-offset limit — a single whole-dump batch overflows it once the dense `event` name
+/// column alone exceeds 2 GiB (a few hundred million rows). 1 Mi rows is a good Parquet row-group
+/// size and bounds peak builder memory to tens of MiB.
+const ROW_GROUP_ROWS: usize = 1 << 20;
+
+/// The column layout of the output, derived once from the (unioned) registry — independent of the
+/// rows. Both the Arrow [`Schema`] (for opening the writer) and the per-chunk builders are produced
+/// from this, so the streamed row groups all share one schema.
+struct ColumnPlan {
+    /// The full Arrow schema: dense common columns, promoted key columns, then per-event structs.
+    schema: Arc<Schema>,
+    /// Display name per schema index (collision-disambiguated; see [`display_names`]).
+    names: Vec<String>,
+    /// Promoted (key / span-id) column names, unioned across events in first-declared order.
+    key_names: Vec<String>,
+    /// Arrow type of each promoted column, by name.
+    key_type: HashMap<String, DataType>,
+}
+
+/// Plans the output columns from the registry alone (no rows needed). The Arrow field order here is
+/// the contract [`build_chunk`] fills, array-for-array.
+fn plan_columns(schemas: &[OwnedSchema]) -> ColumnPlan {
     // Per-schema display name. Two schemas can share a `qualified_name` (same event, different
     // builds → different content-addressed ids); they are genuinely distinct event types, so we
     // disambiguate the name with a `#<id>` suffix *only* when it collides. Unique names stay clean.
     let names = display_names(schemas);
 
-    // --- Plan the columns. ---
     // Promoted columns, unioned by name across all events (first declaration wins the type). Keys
     // and span ids are all promoted to the top level so they are queryable/join-able directly; the
     // rest of each event's fields nest under its per-event struct.
@@ -378,13 +412,79 @@ fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
         }
     }
 
+    let mut fields: Vec<Field> = vec![
+        Field::new("seq", DataType::UInt64, false),
+        Field::new("ts_nanos", DataType::UInt64, false),
+        Field::new("event", DataType::Utf8, false),
+        Field::new("event_id", DataType::UInt64, false),
+        Field::new("instance_id", DataType::UInt64, false),
+    ];
+    for name in &key_names {
+        // A promoted column may be declared by several events; describe it from the first.
+        let decl = schemas
+            .iter()
+            .find_map(|s| s.fields.iter().find(|f| &f.name == name));
+        let mut field = Field::new(name, key_type[name].clone(), true);
+        if let Some(f) = decl {
+            field = field.with_metadata(field_metadata(f));
+        }
+        fields.push(field);
+    }
+    for (idx, s) in schemas.iter().enumerate() {
+        // An event whose fields are all promoted (e.g. a span enter with only span/parent ids) or a
+        // marker event with no fields has nothing left to nest. Parquet can't write an empty struct,
+        // and there is nothing to put in one — the dense `event` column already marks which rows are
+        // this event — so we simply omit its struct column. (Must mirror [`build_chunk`].)
+        let child_fields = struct_child_fields(s);
+        if child_fields.is_empty() {
+            continue;
+        }
+        let dt = DataType::Struct(child_fields);
+        let field = Field::new(&names[idx], dt, true).with_metadata(event_metadata(s));
+        fields.push(field);
+    }
+
+    ColumnPlan {
+        schema: Arc::new(Schema::new(fields)),
+        names,
+        key_names,
+        key_type,
+    }
+}
+
+/// The Arrow child fields of one event's per-event struct column: its non-promoted fields, each
+/// carrying its backbeat semantics. Used by both the plan and the chunk builder so they stay in
+/// lockstep.
+fn struct_child_fields(s: &OwnedSchema) -> Fields {
+    s.fields
+        .iter()
+        .filter(|f| !is_promoted(f.role))
+        .map(|f| Field::new(&f.name, arrow_type(&f.ty), true).with_metadata(field_metadata(f)))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Builds one row-group [`RecordBatch`] from a slice of merged rows. `base_seq` is the global index
+/// of `chunk`'s first row, so the dense `seq` column stays globally monotonic across row groups.
+fn build_chunk(
+    plan: &ColumnPlan,
+    schemas: &[OwnedSchema],
+    chunk: &[Row],
+    base_seq: u64,
+) -> Result<RecordBatch> {
+    let n = chunk.len();
+
     // Dense common builders.
-    let mut seq = UInt64Builder::new();
-    let mut ts = UInt64Builder::new();
+    let mut seq = UInt64Builder::with_capacity(n);
+    let mut ts = UInt64Builder::with_capacity(n);
     let mut event = StringBuilder::new();
-    let mut event_id = UInt64Builder::new();
-    let mut instance_id = UInt64Builder::new();
-    let mut key_cols: Vec<Col> = key_names.iter().map(|n| Col::new(&key_type[n])).collect();
+    let mut event_id = UInt64Builder::with_capacity(n);
+    let mut instance_id = UInt64Builder::with_capacity(n);
+    let mut key_cols: Vec<Col> = plan
+        .key_names
+        .iter()
+        .map(|name| Col::new(&plan.key_type[name]))
+        .collect();
 
     // Per-event struct child builders + the struct's own row validity.
     struct EventCols {
@@ -402,27 +502,27 @@ fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
                 .filter(|f| !is_promoted(f.role))
                 .map(|f| (f.clone(), Col::new(&arrow_type(&f.ty))))
                 .collect(),
-            valid: Vec::with_capacity(rows.len()),
+            valid: Vec::with_capacity(n),
         })
         .collect();
 
     // --- Fill row by row. ---
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in chunk.iter().enumerate() {
         let s = &schemas[row.schema_idx];
-        seq.append_value(i as u64);
+        seq.append_value(base_seq + i as u64);
         ts.append_value(row.ts_nanos);
-        event.append_value(&names[row.schema_idx]);
+        event.append_value(&plan.names[row.schema_idx]);
         event_id.append_value(s.id.get());
         instance_id.append_value(row.instance_id);
 
         // Top-level promoted columns: value if this event declares the column, else null.
-        for (name, col) in key_names.iter().zip(key_cols.iter_mut()) {
+        for (name, col) in plan.key_names.iter().zip(key_cols.iter_mut()) {
             match s
                 .fields
                 .iter()
                 .find(|f| is_promoted(f.role) && &f.name == name)
             {
-                Some(f) => match decode_field(f, row.fields, row.intern) {
+                Some(f) => match decode_field(f, &row.fields, row.intern) {
                     Some(v) => col.append(v),
                     None => col.append_null(),
                 },
@@ -436,7 +536,7 @@ fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
             ec.valid.push(mine);
             for (f, col) in ec.children.iter_mut() {
                 if mine {
-                    match decode_field(f, row.fields, row.intern) {
+                    match decode_field(f, &row.fields, row.intern) {
                         Some(v) => col.append(v),
                         None => col.append_null(),
                     }
@@ -447,81 +547,45 @@ fn build_batch(schemas: &[OwnedSchema], rows: &[Row]) -> Result<RecordBatch> {
         }
     }
 
-    // --- Assemble arrays + arrow schema fields. ---
-    let mut fields: Vec<Field> = Vec::new();
-    let mut arrays: Vec<ArrayRef> = Vec::new();
-
-    fields.push(Field::new("seq", DataType::UInt64, false));
+    // --- Assemble arrays in the exact order `plan.schema` declares. ---
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.schema.fields().len());
     arrays.push(Arc::new(seq.finish()));
-    fields.push(Field::new("ts_nanos", DataType::UInt64, false));
     arrays.push(Arc::new(ts.finish()));
-    fields.push(Field::new("event", DataType::Utf8, false));
     arrays.push(Arc::new(event.finish()));
-    fields.push(Field::new("event_id", DataType::UInt64, false));
     arrays.push(Arc::new(event_id.finish()));
-    fields.push(Field::new("instance_id", DataType::UInt64, false));
     arrays.push(Arc::new(instance_id.finish()));
-
-    for (name, mut col) in key_names.iter().zip(key_cols) {
-        // A promoted column may be declared by several events; describe it from the first.
-        let decl = schemas
-            .iter()
-            .find_map(|s| s.fields.iter().find(|f| &f.name == name));
-        let mut field = Field::new(name, key_type[name].clone(), true);
-        if let Some(f) = decl {
-            field = field.with_metadata(field_metadata(f));
-        }
-        fields.push(field);
+    for mut col in key_cols {
         arrays.push(col.finish());
     }
-
     for (idx, mut ec) in event_cols.into_iter().enumerate() {
-        let s = &schemas[idx];
-        // An event whose fields are all promoted (e.g. a span enter with only span/parent ids) or a
-        // marker event with no fields has nothing left to nest. Parquet can't write an empty struct,
-        // and there is nothing to put in one — the dense `event` column already marks which rows are
-        // this event — so we simply omit its struct column.
         if ec.children.is_empty() {
             continue;
         }
-        let child_fields: Fields = ec
-            .children
-            .iter()
-            .map(|(f, _)| {
-                Field::new(&f.name, arrow_type(&f.ty), true).with_metadata(field_metadata(f))
-            })
-            .collect::<Vec<_>>()
-            .into();
+        let child_fields = struct_child_fields(&schemas[idx]);
         let child_arrays: Vec<ArrayRef> = ec.children.iter_mut().map(|(_, c)| c.finish()).collect();
         let nulls = NullBuffer::from(ec.valid);
-        let struct_array = StructArray::new(child_fields.clone(), child_arrays, Some(nulls));
-        let dt = DataType::Struct(child_fields);
-        // Carry the event's span phase + description as struct-column metadata, so the Parquet is
-        // self-describing without the original dump. Use the (collision-disambiguated) display name.
-        let mut field = Field::new(&names[idx], dt, true);
-        field = field.with_metadata(event_metadata(s));
-        fields.push(field);
+        let struct_array = StructArray::new(child_fields, child_arrays, Some(nulls));
         arrays.push(Arc::new(struct_array));
     }
 
-    let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, arrays).context("assembling record batch")
+    RecordBatch::try_new(plan.schema.clone(), arrays).context("assembling record batch")
 }
 
-/// Writes `batch` to `output` as Parquet, recording `host` in the footer key-value metadata.
+/// Opens a streaming Parquet [`ArrowWriter`] over `output`, recording `host` and the query `ddl` in
+/// the footer key-value metadata. Row groups are written incrementally with [`ArrowWriter::write`].
 ///
 /// The per-row `instance_id` is a column (dumps may be merged), not footer metadata. We deliberately
 /// do *not* embed the original dump: the records already are the Parquet rows, and the per-column
 /// semantics (role, unit, span phase, description) ride along as Arrow *field* metadata on the
-/// schema (see [`build_batch`]). Copying the raw shard rings into the footer would roughly double
+/// schema (see [`plan_columns`]). Copying the raw shard rings into the footer would roughly double
 /// the file for no gain.
-fn write_parquet(
+fn open_writer(
     output: &Path,
-    batch: &RecordBatch,
+    schema: Arc<Schema>,
     host: &str,
     zstd_level: i32,
     ddl: &str,
-) -> Result<()> {
+) -> Result<ArrowWriter<File>> {
     let mut kv = vec![KeyValue::new(
         "backbeat.format".to_string(),
         "1".to_string(),
@@ -545,8 +609,5 @@ fn write_parquet(
         .set_key_value_metadata(Some(kv))
         .build();
     let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
-    writer.write(batch)?;
-    writer.close()?;
-    Ok(())
+    Ok(ArrowWriter::try_new(file, schema, Some(props))?)
 }

@@ -632,7 +632,7 @@ fn merge_then_convert_equals_convert_both() {
     sep_ids.sort_unstable();
     assert_eq!(merged_ids, sep_ids);
     for l in &from_merged {
-        assert_eq!(l.records.len(), 3, "each instance keeps its three records");
+        assert_eq!(l.record_count(), 3, "each instance keeps its three records");
     }
 
     // Converting the merged file produces the same number of rows as converting both sources.
@@ -703,7 +703,7 @@ fn merge_dedups_overlapping_dumps_of_one_recorder() {
 
     // d2 alone holds all six; d1 holds the first three — so the raw set is nine, six distinct.
     let raw = backbeat_cli::model::load_many(&[a.clone(), b.clone()]).unwrap();
-    let raw_total: usize = raw.iter().map(|l| l.records.len()).sum();
+    let raw_total: usize = raw.iter().map(|l| l.record_count()).sum();
     assert_eq!(
         raw_total, 9,
         "both dumps overlap on the first three records"
@@ -721,14 +721,13 @@ fn merge_dedups_overlapping_dumps_of_one_recorder() {
         backbeat_cli::model::load(&merged, std::fs::read(&merged).unwrap().into()).unwrap();
     assert_eq!(from_merged.len(), 1, "one instance");
     assert_eq!(
-        from_merged[0].records.len(),
+        from_merged[0].record_count(),
         6,
         "merge trimmed the three duplicates"
     );
     // The packet numbers 0..6 are all present and unique.
     let mut nums: Vec<u64> = from_merged[0]
-        .records
-        .iter()
+        .records()
         .map(|r| u64::from_le_bytes(r.fields[8..16].try_into().unwrap()))
         .collect();
     nums.sort_unstable();
@@ -739,7 +738,7 @@ fn merge_dedups_overlapping_dumps_of_one_recorder() {
     backbeat_cli::merge::merge(&[a.clone(), b.clone()], &spliced, false).unwrap();
     let from_spliced =
         backbeat_cli::model::load(&spliced, std::fs::read(&spliced).unwrap().into()).unwrap();
-    let spliced_total: usize = from_spliced.iter().map(|l| l.records.len()).sum();
+    let spliced_total: usize = from_spliced.iter().map(|l| l.record_count()).sum();
     assert_eq!(spliced_total, 9, "splice keeps duplicates");
     // But convert still dedups on the way out.
     assert_eq!(backbeat_cli::model::unique_records(&from_spliced).len(), 6);
