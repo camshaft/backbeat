@@ -159,22 +159,31 @@ pub struct MergedRec<'a> {
     pub fields: Bytes,
 }
 
-/// The full ordering/identity key of a record: `(ts_nanos, instance_id, shard_id, event_id,
-/// fields)`. Sorting by it yields the global converter order *and* makes byte-identical records
-/// (the same logged event re-captured by overlapping dumps) adjacent, so [`merge_records`] drops
-/// duplicates with an equality check against the previously emitted key — no hash set.
+/// The full ordering/identity key of a record: `(ts_nanos, instance_id, shard_id, offset)`. These
+/// four values *are* a record's true identity — the ring is a bump allocator over a monotonic
+/// cursor (see [`backbeat::ring`]), so a record lands at one fixed offset in its `(instance_id,
+/// shard_id)` ring for the recorder's whole life. Two overlapping dumps that re-capture the same
+/// logged event therefore reproduce the identical offset, making their keys equal; [`merge_records`]
+/// drops the duplicate with an equality check against the previously emitted key — no hash set.
+/// Sorting by this key also yields the global converter order.
 ///
-/// `local_seq` is deliberately absent: it is assigned per-walk, so the same event gets different
-/// seqs in two dumps and could never match; `(event_id, fields)` already breaks ties
-/// deterministically. The fields are a refcounted slice of the dump buffer, so a key costs no
-/// allocation.
-#[derive(Clone, PartialEq, Eq)]
+/// `event_id` and `fields` are deliberately absent — comparing the variable-length field bytes was
+/// the dominant cost of both the per-shard sort and the merge, and the offset already pins identity:
+/// within one dump's snapshot a physical offset belongs to at most one walked record, and across
+/// dumps a shared physical slot implies a full ring-cycle (`capacity` bytes) gap in absolute offset,
+/// hence a different `ts_nanos`. So `(ts_nanos, offset)` separates distinct records within a shard
+/// without ever touching their bytes. `local_seq` is likewise absent: it is assigned per-walk, so
+/// the same event gets different seqs in two dumps and could never match.
+///
+/// (The at-most-one boundary-wrapping record per shard carries the [`WRAPPED`] sentinel offset; it
+/// is consistent across dumps — whether a record straddles the physical boundary depends only on its
+/// fixed absolute range mod `capacity` — so it dedups on `(ts_nanos, WRAPPED)` like any other.)
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Key {
     ts_nanos: u64,
     instance_id: u64,
     shard_id: u32,
-    event_id: u64,
-    fields: Bytes,
+    offset: u32,
 }
 
 impl Ord for Key {
@@ -183,8 +192,7 @@ impl Ord for Key {
             .cmp(&other.ts_nanos)
             .then(self.instance_id.cmp(&other.instance_id))
             .then(self.shard_id.cmp(&other.shard_id))
-            .then(self.event_id.cmp(&other.event_id))
-            .then_with(|| self.fields.cmp(&other.fields))
+            .then(self.offset.cmp(&other.offset))
     }
 }
 impl PartialOrd for Key {
@@ -273,31 +281,11 @@ pub fn load(path: &Path, bytes: Bytes) -> Result<Vec<Loaded>> {
             );
 
             // Sort this shard's locators by the merge key's per-stream projection
-            // `(ts_nanos, event_id, fields)`, so a k-way merge across shards is globally ordered and
-            // byte-identical duplicates land adjacent for dedup. `fields_at` borrows only the region
-            // and wrapped payload (not the not-yet-built `ShardRecs`), so the sort can mutate `locs`.
-            let region = &shard.region;
-            let fields_at = |loc: &Locator| -> Bytes {
-                let rec_size = schemas[loc.schema_idx as usize].record_size as usize;
-                if loc.offset == WRAPPED {
-                    let payload = wrapped.as_ref().expect("WRAPPED locator without payload");
-                    payload.slice(FIELDS_OFFSET..FIELDS_OFFSET + rec_size)
-                } else {
-                    let start = loc.offset as usize + FIELDS_OFFSET;
-                    region.slice(start..start + rec_size)
-                }
-            };
-            locs.sort_by(|a, b| {
-                a.ts_nanos
-                    .cmp(&b.ts_nanos)
-                    .then_with(|| {
-                        schemas[a.schema_idx as usize]
-                            .id
-                            .get()
-                            .cmp(&schemas[b.schema_idx as usize].id.get())
-                    })
-                    .then_with(|| fields_at(a).cmp(&fields_at(b)))
-            });
+            // `(ts_nanos, offset)` (`instance_id`/`shard_id` are constant within a shard), so a
+            // k-way merge across shards is globally ordered and duplicates land adjacent for dedup.
+            // This is a pure integer compare — no field-byte slicing — because the offset already
+            // identifies the record (see [`Key`]).
+            locs.sort_by(|a, b| a.ts_nanos.cmp(&b.ts_nanos).then(a.offset.cmp(&b.offset)));
 
             let sh = ShardRecs {
                 shard_id: shard.shard_id,
@@ -366,15 +354,16 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    /// The merge key of the locator at the cursor's current position (`None` if exhausted).
+    /// The merge key of the locator at the cursor's current position (`None` if exhausted). Built
+    /// from the locator's `(ts_nanos, offset)` alone — no schema lookup, no field slice — since the
+    /// offset already identifies the record within its shard (see [`Key`]).
     fn key(&self) -> Option<Key> {
         let loc = self.shard.locs.get(self.pos)?;
         Some(Key {
             ts_nanos: loc.ts_nanos,
             instance_id: self.loaded.instance_id,
             shard_id: self.shard.shard_id,
-            event_id: self.loaded.schemas[loc.schema_idx as usize].id.get(),
-            fields: self.shard.fields(loc, &self.loaded.schemas),
+            offset: loc.offset,
         })
     }
 }
