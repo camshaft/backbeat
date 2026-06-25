@@ -36,6 +36,23 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Maximum worker threads for the parallel decode/convert path (rayon pool size).
+    ///
+    /// Decoding fans out across input dumps and their shards; on a many-core host that can drive
+    /// peak memory and I/O far higher than expected for a handful of large dumps. This caps it.
+    /// Defaults to a deliberately conservative `min(4, cpus / 4)` (at least 1) — raise it when you
+    /// have headroom and want the throughput, lower it to `1` to decode serially.
+    #[arg(long, global = true)]
+    threads: Option<usize>,
+}
+
+/// The conservative default rayon pool size: `min(4, available_parallelism / 4)`, floored at 1. A
+/// big box (64 cores) lands at 4; a 4-core laptop lands at 1. Keeps a multi-dump decode from
+/// fanning out across every core (and faulting in every dump's pages at once) unless asked.
+fn default_threads() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cpus / 4).clamp(1, 4)
 }
 
 /// The output format for `convert`.
@@ -117,6 +134,16 @@ fn resolve_format(format: Option<Format>, output: Option<&Path>) -> Result<Forma
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Size the global rayon pool before any parallel work runs. Every parallel section (multi-dump
+    // load, per-shard walk) draws from this one pool, so this single cap bounds the whole tool's
+    // fan-out — and thus how many dumps/shards are decoded (and paged in) at once.
+    let threads = cli.threads.unwrap_or_else(default_threads);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .context("configuring the worker thread pool")?;
+
     match cli.command {
         Command::Convert {
             dumps,
@@ -171,8 +198,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Inspect { dump } => {
-            let bytes =
-                std::fs::read(&dump).with_context(|| format!("reading dump {}", dump.display()))?;
+            let bytes = model::map_dump(&dump)?;
             inspect::inspect(bytes, &mut std::io::stdout())
                 .with_context(|| format!("inspecting {}", dump.display()))
         }

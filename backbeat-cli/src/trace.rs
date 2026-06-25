@@ -37,10 +37,11 @@ use std::{
 /// fields), then a second pass that decodes and emits each event's JSON and immediately drops it.
 /// Peak extra memory is therefore one event, not all of them.
 pub fn to_trace(dumps: &[Loaded], output: &Path) -> Result<usize> {
-    // Deduplicate up front: overlapping dumps re-capture shared ring contents, and a duplicated
-    // span enter/exit would corrupt the orphan accounting as well as double the output. The set is
-    // references into the dump buffers (no record copy) — see `model::unique_records`.
-    let records = model::unique_records(dumps);
+    // Both passes consume the lazy, de-duplicated k-way merge (overlapping dumps re-capture shared
+    // ring contents, and a duplicated span enter/exit would corrupt the orphan accounting as well as
+    // double the output). Streaming it twice re-walks the already-sorted per-shard locators — cheap,
+    // and it never materializes the record set, so a huge dump stays bounded. Each record's field
+    // bytes are a zero-copy slice of the dump mmap — see `model::merge_records`.
 
     // Pass 1: the trace's max timestamp (for synthetic orphan closes) and which (instance, span)
     // keys have an enter / an exit. This touches only span ids and phases — no field decoding, no
@@ -48,8 +49,8 @@ pub fn to_trace(dumps: &[Loaded], output: &Path) -> Result<usize> {
     let mut max_ts = 0u64;
     let mut has_enter: HashSet<(u64, u64)> = HashSet::new();
     let mut has_exit: HashSet<(u64, u64)> = HashSet::new();
-    for (d, r) in &records {
-        let s = &d.schemas[r.schema_idx];
+    for r in model::merge_records(dumps) {
+        let s = &r.loaded.schemas[r.schema_idx];
         max_ts = max_ts.max(r.ts_nanos);
         if let Some(sid) = s
             .span_id()
@@ -57,10 +58,10 @@ pub fn to_trace(dumps: &[Loaded], output: &Path) -> Result<usize> {
         {
             match s.phase {
                 Phase::Enter => {
-                    has_enter.insert((d.instance_id, sid));
+                    has_enter.insert((r.loaded.instance_id, sid));
                 }
                 Phase::Exit => {
-                    has_exit.insert((d.instance_id, sid));
+                    has_exit.insert((r.loaded.instance_id, sid));
                 }
                 _ => {}
             }
@@ -75,7 +76,8 @@ pub fn to_trace(dumps: &[Loaded], output: &Path) -> Result<usize> {
     write!(w, "{{\"displayTimeUnit\":\"ns\",\"traceEvents\":[").context("writing trace JSON")?;
 
     let mut count = 0usize;
-    for (d, r) in &records {
+    for r in model::merge_records(dumps) {
+        let d = r.loaded;
         let s = &d.schemas[r.schema_idx];
         let span_id = s
             .span_id()

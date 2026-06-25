@@ -22,7 +22,7 @@
 //! `instance_id`s are preserved, so converting the merged file yields exactly what converting the
 //! inputs together would.
 
-use crate::model::{self, Loaded, Rec};
+use crate::model;
 use anyhow::{Context, Result};
 use backbeat::{
     format::SectionKind,
@@ -88,8 +88,8 @@ fn merge_splice(inputs: &[PathBuf], output: &Path) -> Result<usize> {
     let spliceables: Vec<Spliceable> = inputs
         .par_iter()
         .map(|p| {
-            let bytes = fs::read(p).with_context(|| format!("reading dump {}", p.display()))?;
-            read_spliceable(p, bytes.into())
+            let bytes = model::map_dump(p)?;
+            read_spliceable(p, bytes)
         })
         .collect::<Result<_>>()?;
 
@@ -168,20 +168,27 @@ fn merge_dedup(inputs: &[PathBuf], output: &Path) -> Result<usize> {
         }
     }
 
-    // Group the de-duplicated records by their owning (instance_id, shard_id). `unique_records`
-    // drops any record re-captured by an overlapping dump, so each survivor is emitted once.
-    // BTreeMap keeps a deterministic instance/shard order in the output. We keep the `(Loaded, Rec)`
-    // pair so re-packing can resolve each record's event id via its schema.
-    let mut by_shard: BTreeMap<(u64, u32), Vec<(&Loaded, &Rec)>> = BTreeMap::new();
+    // Group the de-duplicated records by their owning (instance_id, shard_id). The streaming merge
+    // drops any record re-captured by an overlapping dump, so each survivor is emitted once, and it
+    // yields them in global ascending order — so within each shard bucket they arrive oldest-first,
+    // exactly what `repack_shard` wants. BTreeMap keeps a deterministic instance/shard order. We keep
+    // only what re-packing needs per record: its event id (resolved here via its schema), timestamp,
+    // and field bytes (a zero-copy slice of the source mmap).
+    let mut by_shard: BTreeMap<(u64, u32), Vec<RepackRec>> = BTreeMap::new();
     let mut hosts: BTreeMap<u64, String> = BTreeMap::new();
     let mut interns: BTreeMap<u64, Vec<(u32, Vec<u8>)>> = BTreeMap::new();
     let mut instance_ids: HashSet<u64> = HashSet::new();
-    for (d, r) in model::unique_records(&dumps) {
+    for r in model::merge_records(&dumps) {
+        let event_id = r.loaded.schemas[r.schema_idx].id.get();
         by_shard
-            .entry((d.instance_id, r.shard_id))
+            .entry((r.loaded.instance_id, r.shard_id))
             .or_default()
-            .push((d, r));
-        instance_ids.insert(d.instance_id);
+            .push(RepackRec {
+                event_id,
+                ts_nanos: r.ts_nanos,
+                fields: r.fields,
+            });
+        instance_ids.insert(r.loaded.instance_id);
     }
     // Carry each instance's host label and intern table through. Every instance that appeared in
     // any input keeps its metadata even if dedup left it with no records, matching what loading the
@@ -226,30 +233,37 @@ fn merge_dedup(inputs: &[PathBuf], output: &Path) -> Result<usize> {
     Ok(registry.len())
 }
 
+/// One record retained for re-packing: its event id, timestamp, and field bytes (a zero-copy slice
+/// of the source dump mmap).
+struct RepackRec {
+    event_id: u64,
+    ts_nanos: u64,
+    fields: bytes::Bytes,
+}
+
 /// Re-packs a shard's surviving records into a fresh, compactly-sized ring region.
 ///
 /// Records are written oldest-first as `[ts][event_id][fields]` payloads each followed by the
 /// little-endian length suffix — exactly the layout [`crate::model::load`] walks back out. The
 /// region is the next power of two large enough to hold them all (a `Ring` capacity must be a power
 /// of two), and `head` is the total bytes written, so the walk recovers every record and nothing
-/// else. Each record's event id comes from its owning [`Loaded`]'s schema. Returns `(region, head)`.
+/// else. Returns `(region, head)`.
 ///
-/// `recs` are passed oldest-first (`Loaded::records` is sorted ascending by `(ts, shard, seq)`), so
-/// we write them in order — oldest at offset 0, newest nearest `head` — and a re-walk from `head`
-/// recovers them newest-first, exactly as the original ring did.
-fn repack_shard(recs: &[(&Loaded, &Rec)]) -> (Vec<u8>, u64) {
+/// `recs` are passed oldest-first (the streaming merge yields global ascending order, so a shard's
+/// bucket fills oldest-first), so we write them in order — oldest at offset 0, newest nearest `head`
+/// — and a re-walk from `head` recovers them newest-first, exactly as the original ring did.
+fn repack_shard(recs: &[RepackRec]) -> (Vec<u8>, u64) {
     // Each record occupies prefix(16) + fields + suffix(2). Sum to size the ring exactly.
     let needed: usize = recs
         .iter()
-        .map(|(_, r)| FIELDS_OFFSET + r.fields.len() + LEN_SUFFIX)
+        .map(|r| FIELDS_OFFSET + r.fields.len() + LEN_SUFFIX)
         .sum();
     let capacity = needed.max(1).next_power_of_two();
     let mut region = vec![0u8; capacity];
 
     let mut at = 0usize;
-    for (d, r) in recs {
-        let event_id = d.schemas[r.schema_idx].id.get();
-        at += write_record(&mut region[at..], r.ts_nanos, event_id, &r.fields);
+    for r in recs {
+        at += write_record(&mut region[at..], r.ts_nanos, r.event_id, &r.fields);
     }
     (region, at as u64)
 }
