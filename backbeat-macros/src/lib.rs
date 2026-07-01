@@ -42,6 +42,11 @@
 //! * `#[event(span = enter)]` / `#[event(span = exit)]` — mark this event as one half of a span, so
 //!   the trace converter can pair begin/end records into a duration slice. A spanned event must
 //!   carry exactly one `#[event(span_id)]` field.
+//! * `#[event(crate = <path>)]` — reroot the paths the generated code references (default
+//!   `::backbeat`) at `<path>`. Use this when backbeat is re-exported from a wrapper crate — e.g.
+//!   `#[event(crate = my_crate::backbeat)]` — so the derive resolves the traits and helpers through
+//!   that re-export instead of assuming a direct `backbeat` dependency. `#[derive(EventEnum)]`
+//!   accepts the same attribute.
 //!
 //! Field attributes (mutually-exclusive *roles* — at most one per field):
 //!
@@ -70,7 +75,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Expr, ExprLit, Fields, Lit, LitStr, Type};
+use syn::{
+    parse_macro_input, parse_quote, Data, DeriveInput, Expr, ExprLit, Fields, Lit, LitStr, Path,
+    Type,
+};
 
 /// A field's role, mirroring `backbeat::schema::FieldRole` on the macro side.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,12 +89,12 @@ enum Role {
 }
 
 impl Role {
-    /// The `backbeat::schema::FieldRole` variant tokens this role emits.
-    fn tokens(self) -> TokenStream2 {
+    /// The `backbeat::schema::FieldRole` variant tokens this role emits, rooted at `krate`.
+    fn tokens(self, krate: &Path) -> TokenStream2 {
         match self {
-            Role::Key => quote! { ::backbeat::schema::FieldRole::Key },
-            Role::SpanId => quote! { ::backbeat::schema::FieldRole::SpanId },
-            Role::ParentSpanId => quote! { ::backbeat::schema::FieldRole::ParentSpanId },
+            Role::Key => quote! { #krate::schema::FieldRole::Key },
+            Role::SpanId => quote! { #krate::schema::FieldRole::SpanId },
+            Role::ParentSpanId => quote! { #krate::schema::FieldRole::ParentSpanId },
         }
     }
 }
@@ -100,11 +108,11 @@ enum Phase {
 }
 
 impl Phase {
-    fn tokens(self) -> TokenStream2 {
+    fn tokens(self, krate: &Path) -> TokenStream2 {
         match self {
-            Phase::None => quote! { ::backbeat::schema::Phase::None },
-            Phase::Enter => quote! { ::backbeat::schema::Phase::Enter },
-            Phase::Exit => quote! { ::backbeat::schema::Phase::Exit },
+            Phase::None => quote! { #krate::schema::Phase::None },
+            Phase::Enter => quote! { #krate::schema::Phase::Enter },
+            Phase::Exit => quote! { #krate::schema::Phase::Exit },
         }
     }
 }
@@ -122,7 +130,7 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
 
 /// Derives `EventEnum` for a fieldless `#[repr(u8|u16|u32|u64)]` enum, so it can be a strongly-typed
 /// event field. Emits the variant→label map and the repr width.
-#[proc_macro_derive(EventEnum)]
+#[proc_macro_derive(EventEnum, attributes(event))]
 pub fn derive_event_enum(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand_event_enum(input) {
@@ -133,6 +141,9 @@ pub fn derive_event_enum(input: TokenStream) -> TokenStream {
 
 fn expand_event_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
+
+    // `#[event(crate = <path>)]` reroots the emitted paths; defaults to `::backbeat`.
+    let krate = crate_path(&input.attrs)?;
 
     let data = match &input.data {
         Data::Enum(e) => e,
@@ -171,14 +182,14 @@ fn expand_event_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
                 )),
             };
         labels.push(quote! {
-            ::backbeat::schema::EnumLabel { value: (#value) as u64, label: #label }
+            #krate::schema::EnumLabel { value: (#value) as u64, label: #label }
         });
     }
 
     Ok(quote! {
-        impl ::backbeat::EventEnum for #name {
+        impl #krate::EventEnum for #name {
             const REPR: u8 = #repr;
-            const LABELS: &'static [::backbeat::schema::EnumLabel] = &[ #(#labels),* ];
+            const LABELS: &'static [#krate::schema::EnumLabel] = &[ #(#labels),* ];
         }
     })
 }
@@ -216,8 +227,9 @@ fn enum_repr_width(input: &DeriveInput) -> syn::Result<u8> {
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
 
-    // Container attributes: namespace (required) and span phase (optional).
+    // Container attributes: namespace (required), span phase, and crate reroot (both optional).
     let container = ContainerAttrs::parse(&input)?;
+    let krate = &container.krate;
 
     // `#[derive(Event)]` describes a fixed C layout; anything else has no stable offsets to reflect.
     let fields =
@@ -294,21 +306,21 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         // variants it cannot see.
         let (ty_expr, labels_expr) = if let Some(dynamic) = attrs.interned {
             (
-                quote! { ::backbeat::schema::FieldType::Interned { dynamic: #dynamic } },
+                quote! { #krate::schema::FieldType::Interned { dynamic: #dynamic } },
                 quote! { &[] },
             )
         } else {
             (
-                quote! { <#fty as ::backbeat::FieldTy>::FIELD_TYPE },
-                quote! { <#fty as ::backbeat::FieldTy>::LABELS },
+                quote! { <#fty as #krate::FieldTy>::FIELD_TYPE },
+                quote! { <#fty as #krate::FieldTy>::LABELS },
             )
         };
 
         let desc_expr = opt_str(fdesc.as_deref());
         let unit_expr = opt_str(attrs.unit.as_deref());
         let role_expr = match attrs.role {
-            Some(r) => r.tokens(),
-            None => quote! { ::backbeat::schema::FieldRole::None },
+            Some(r) => r.tokens(krate),
+            None => quote! { #krate::schema::FieldRole::None },
         };
         // Emit the sentinel as the zero-extended image of the field's stored bytes, which is what
         // the converter reconstructs with a width-bounded `read_uint`. We (a) cast through the
@@ -330,12 +342,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         };
 
         field_defs.push(quote! {
-            ::backbeat::schema::FieldSchema {
+            #krate::schema::FieldSchema {
                 name: #fname,
                 description: #desc_expr,
                 ty: #ty_expr,
-                offset: ::backbeat::schema::layout_u16(::core::mem::offset_of!(#name, #ident)),
-                width: ::backbeat::schema::layout_u16(::core::mem::size_of::<#fty>()),
+                offset: #krate::schema::layout_u16(::core::mem::offset_of!(#name, #ident)),
+                width: #krate::schema::layout_u16(::core::mem::size_of::<#fty>()),
                 role: #role_expr,
                 unit: #unit_expr,
                 sentinel: #sentinel_expr,
@@ -387,9 +399,10 @@ fn emit(
     description: Option<String>,
     field_defs: Vec<TokenStream2>,
 ) -> TokenStream2 {
+    let krate = &container.krate;
     let qualified = format!("{}::{name}", container.namespace);
     let desc_expr = opt_str(description.as_deref());
-    let phase_expr = container.phase.tokens();
+    let phase_expr = container.phase.tokens(krate);
 
     quote! {
         impl #name {
@@ -398,39 +411,39 @@ fn emit(
 
             /// The reflected field layout (also held by [`Self::SCHEMA`]). Named so [`Self::ID`] can
             /// hash it without referencing `SCHEMA` (which embeds the id — that would be circular).
-            const FIELDS: &'static [::backbeat::schema::FieldSchema] = &[ #(#field_defs),* ];
+            const FIELDS: &'static [#krate::schema::FieldSchema] = &[ #(#field_defs),* ];
 
             /// Content-addressed event id: a hash of the whole schema (name, phase, every field's
             /// name/type/offset/width/role/unit and any enum labels). Two builds with differing
             /// layouts get distinct ids and are treated as separate event types sharing a name.
-            pub const ID: ::backbeat::id::EventId =
-                ::backbeat::schema::EventSchema::compute_id(
+            pub const ID: #krate::id::EventId =
+                #krate::schema::EventSchema::compute_id(
                     Self::QUALIFIED_NAME,
                     #phase_expr,
                     Self::FIELDS,
                 );
 
             /// Self-describing layout of this event, reflected from its fields at compile time.
-            pub const SCHEMA: ::backbeat::schema::EventSchema =
-                ::backbeat::schema::EventSchema {
+            pub const SCHEMA: #krate::schema::EventSchema =
+                #krate::schema::EventSchema {
                     id: Self::ID,
                     qualified_name: Self::QUALIFIED_NAME,
                     description: #desc_expr,
-                    record_size: ::backbeat::schema::layout_u16(::core::mem::size_of::<#name>()),
+                    record_size: #krate::schema::layout_u16(::core::mem::size_of::<#name>()),
                     phase: #phase_expr,
                     fields: Self::FIELDS,
                 };
         }
 
-        impl ::backbeat::Event for #name {
-            const SCHEMA: ::backbeat::schema::EventSchema = Self::SCHEMA;
-            const ID: ::backbeat::id::EventId = Self::ID;
+        impl #krate::Event for #name {
+            const SCHEMA: #krate::schema::EventSchema = Self::SCHEMA;
+            const ID: #krate::id::EventId = Self::ID;
             const QUALIFIED_NAME: &'static str = Self::QUALIFIED_NAME;
         }
 
         // Register the type so the dumper can self-populate its schema registry. Expands to a
         // `submit!` under `std` and to nothing on `no_std` (see `backbeat::register_event!`).
-        ::backbeat::register_event!(#name);
+        #krate::register_event!(#name);
     }
 }
 
@@ -516,12 +529,17 @@ impl FieldAttrs {
 struct ContainerAttrs {
     namespace: String,
     phase: Phase,
+    /// The path the generated code roots its `backbeat` references at, from
+    /// `#[event(crate = <path>)]`; defaults to `::backbeat`. Lets a wrapper crate re-export
+    /// backbeat under its own name and still derive events.
+    krate: Path,
 }
 
 impl ContainerAttrs {
     fn parse(input: &DeriveInput) -> syn::Result<Self> {
         let mut namespace = None;
         let mut phase = Phase::None;
+        let mut krate = None;
         for attr in &input.attrs {
             if !attr.path().is_ident("event") {
                 continue;
@@ -530,6 +548,13 @@ impl ContainerAttrs {
                 if meta.path.is_ident("namespace") {
                     let lit: LitStr = meta.value()?.parse()?;
                     namespace = Some(lit.value());
+                    Ok(())
+                } else if meta.path.is_ident("crate") {
+                    // `crate = <path>`: reroot emitted `::backbeat::…` references at `<path>`.
+                    if krate.is_some() {
+                        return Err(meta.error("duplicate `crate` in `#[event(...)]`"));
+                    }
+                    krate = Some(parse_crate_path(&meta)?);
                     Ok(())
                 } else if meta.path.is_ident("span") {
                     // `span = enter` or `span = exit`.
@@ -553,8 +578,51 @@ impl ContainerAttrs {
                 "`#[derive(Event)]` requires `#[event(namespace = \"...\")]`",
             )
         })?;
-        Ok(Self { namespace, phase })
+        let krate = krate.unwrap_or_else(default_crate_path);
+        Ok(Self {
+            namespace,
+            phase,
+            krate,
+        })
     }
+}
+
+/// The default crate path (`::backbeat`) the generated code roots at when no
+/// `#[event(crate = <path>)]` is given.
+fn default_crate_path() -> Path {
+    parse_quote! { ::backbeat }
+}
+
+/// Parses the `<path>` in `#[event(crate = <path>)]`. Accepts any path so a wrapper crate can point
+/// at its own re-export (`crate`, `my_crate::backbeat`, `::some::backbeat`).
+fn parse_crate_path(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<Path> {
+    meta.value()?.parse()
+}
+
+/// Scans container attributes for a single `#[event(crate = <path>)]`, defaulting to `::backbeat`.
+/// Used by `#[derive(EventEnum)]`, which has no other container attributes.
+fn crate_path(attrs: &[syn::Attribute]) -> syn::Result<Path> {
+    let mut krate = None;
+    for attr in attrs {
+        if !attr.path().is_ident("event") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                if krate.is_some() {
+                    return Err(meta.error("duplicate `crate` in `#[event(...)]`"));
+                }
+                krate = Some(parse_crate_path(&meta)?);
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unknown `#[event(...)]` attribute (`#[derive(EventEnum)]` only \
+                                 accepts `crate = <path>`)",
+                ))
+            }
+        })?;
+    }
+    Ok(krate.unwrap_or_else(default_crate_path))
 }
 
 /// Whether a field type is the bare `bool` primitive.
