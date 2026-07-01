@@ -551,6 +551,9 @@ impl ContainerAttrs {
                     Ok(())
                 } else if meta.path.is_ident("crate") {
                     // `crate = <path>`: reroot emitted `::backbeat::…` references at `<path>`.
+                    if krate.is_some() {
+                        return Err(meta.error("duplicate `crate` in `#[event(...)]`"));
+                    }
                     krate = Some(parse_crate_path(&meta)?);
                     Ok(())
                 } else if meta.path.is_ident("span") {
@@ -606,6 +609,9 @@ fn crate_path(attrs: &[syn::Attribute]) -> syn::Result<Path> {
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("crate") {
+                if krate.is_some() {
+                    return Err(meta.error("duplicate `crate` in `#[event(...)]`"));
+                }
                 krate = Some(parse_crate_path(&meta)?);
                 Ok(())
             } else {
