@@ -174,3 +174,43 @@ fn content_addressed_id_forks_on_layout_change() {
     // …but different layouts → different ids, so they're distinct event types in a registry.
     assert_ne!(v1::Evt::ID, v2::Evt::ID);
 }
+
+// A wrapper crate that re-exports backbeat under its own path. `#[event(crate = …)]` must make the
+// derive resolve every generated reference (traits, schema types, `register_event!`) through this
+// re-export rather than a hard-coded `::backbeat`.
+mod wrapper {
+    pub use backbeat::*;
+}
+
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy)]
+#[event(crate = crate::wrapper)]
+#[repr(u8)]
+#[allow(dead_code)]
+enum Flavor {
+    Sweet = 0,
+    Sour = 1,
+}
+
+/// An event derived through a re-exported backbeat.
+#[derive(Event, IntoBytes, Immutable)]
+#[event(crate = crate::wrapper, namespace = "wrapped::app")]
+#[repr(C)]
+struct Wrapped {
+    #[event(key)]
+    id: u64,
+    flavor: Flavor,
+    _pad: [u8; 7],
+}
+
+#[test]
+fn crate_path_reroots_generated_references() {
+    // The derive compiled at all resolving through `crate::wrapper`, and the schema is well-formed.
+    assert_eq!(Wrapped::QUALIFIED_NAME, "wrapped::app::Wrapped");
+    assert_eq!(Wrapped::ID, Wrapped::SCHEMA.id);
+    assert_eq!(Wrapped::SCHEMA.field("id").unwrap().role, FieldRole::Key);
+    // The enum field resolved its labels through the re-exported `EventEnum` impl.
+    let flavor = Wrapped::SCHEMA.field("flavor").unwrap();
+    assert_eq!(flavor.ty, FieldType::Enum { repr: 1 });
+    let labels: Vec<_> = flavor.enum_labels.iter().map(|l| l.label).collect();
+    assert_eq!(labels, ["Sweet", "Sour"]);
+}
