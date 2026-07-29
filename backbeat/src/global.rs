@@ -19,8 +19,9 @@
 //!
 //! ## Lifecycle
 //!
-//! The recorder is built on first use ([`recorder`]/[`record`]/[`trigger`]) from environment
-//! overrides (read once):
+//! The recorder is built on first use ([`recorder`]/[`record`]/[`trigger`]) from a staged
+//! programmatic [`Config`] (if one was installed via [`configure`]/[`init`] before first use) and,
+//! for any setting the config leaves unset, from environment overrides (read once):
 //!
 //! * `BACKBEAT_SHARDS` — number of per-CPU rings (default: available parallelism, capped).
 //! * `BACKBEAT_BYTES` — bytes per shard (default 16 MiB), floored at one page.
@@ -36,8 +37,28 @@
 //!   a binary can be traced without a code change to call [`enable`]).
 //! * `BACKBEAT_DUMP_ON_PANIC` — if truthy, install a panic hook that triggers a final dump.
 //!
-//! Capture starts **disabled**; call [`enable`] (or set `BACKBEAT_ENABLE`). With the `capture`
-//! feature compiled out, [`record`] folds to nothing — see [`crate::recorder`].
+//! Capture starts **disabled**; call [`enable`] (or set `BACKBEAT_ENABLE`, or [`Config::enable`]).
+//! With the `capture` feature compiled out, [`record`] folds to nothing — see [`crate::recorder`].
+//!
+//! ## Programmatic configuration
+//!
+//! For a host that configures the recorder from something other than the environment (a config
+//! file, CLI flags, …), stage a [`Config`] with [`configure`] (or [`configure`] + eager build via
+//! [`init`]) **before** the recorder is first used:
+//!
+//! ```no_run
+//! use backbeat::global::{self, Config};
+//!
+//! let config = Config::builder()
+//!     .enable(true)
+//!     .dir(std::path::PathBuf::from("/var/log/backbeat")) // dumps: <dir>/backbeat.<pid>.<ts>.bb
+//!     .build();
+//! global::init(config);
+//! ```
+//!
+//! Each field is an [`Option`]: a `None` field falls back to its `BACKBEAT_*` environment variable
+//! and then to the built-in default, so an all-`None` `Config` behaves exactly like the env-only
+//! path and a partially-specified one composes with it.
 //!
 //! ## Dumps
 //!
@@ -99,6 +120,183 @@ impl LimitPolicy {
             _ => None,
         }
     }
+}
+
+/// Programmatic configuration for the process-wide recorder — an alternative to the `BACKBEAT_*`
+/// environment variables. Build one with [`Config::builder`], then stage it with [`configure`] (or
+/// [`init`], which also builds eagerly) **before** the recorder is first used, i.e. before the
+/// first [`record`]/[`trigger`]/[`recorder`]/[`enable`] call.
+///
+/// Every field is an [`Option`]. A `None` field (one the builder never set) falls back to that
+/// setting's `BACKBEAT_*` environment variable and then to the built-in default; a `Some` field
+/// takes precedence over the environment. So a default `Config` is exactly equivalent to the
+/// env-only behavior, and one that sets only some fields overrides only those.
+///
+/// The struct is `#[non_exhaustive]` and constructed only through [`ConfigBuilder`], so new
+/// settings can be added without breaking callers. Fields remain public for reading (e.g. by a
+/// config layer translating into this type), but a literal `Config { .. }` is not constructible
+/// outside this crate — use the builder.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Config {
+    /// Arm capture as soon as the recorder is built (cf. `BACKBEAT_ENABLE`). `Some(false)` does
+    /// not force capture off — it just declines to enable it here; `BACKBEAT_ENABLE` is still
+    /// honored. Capture always starts disabled unless something enables it.
+    pub enable: Option<bool>,
+    /// Target **directory** for dumps. The per-process base path becomes
+    /// `<dir>/backbeat.<pid>.bb`, and each dump inserts a UTC timestamp before the extension (see
+    /// [`stamped_path`]). Takes precedence over `BACKBEAT_PATH` (which names a base *file* path).
+    pub dir: Option<PathBuf>,
+    /// Number of per-CPU shards (cf. `BACKBEAT_SHARDS`). Floored at 1.
+    pub shards: Option<usize>,
+    /// Bytes per shard (cf. `BACKBEAT_BYTES`). Floored at one page.
+    pub bytes_per_shard: Option<usize>,
+    /// Minimum interval between dumps, in milliseconds (cf. `BACKBEAT_THROTTLE_MS`).
+    pub throttle_ms: Option<u64>,
+    /// Cap on the number of dump files kept; `Some(0)` means unlimited (cf. `BACKBEAT_MAX_DUMPS`).
+    pub max_dumps: Option<u64>,
+    /// What to do at the dump-file cap (cf. `BACKBEAT_LIMIT_POLICY`).
+    pub limit_policy: Option<LimitPolicy>,
+    /// Host label embedded in each dump (cf. `BACKBEAT_HOST`). An empty string is ignored.
+    pub host: Option<String>,
+    /// Install a `kill -<sig>` dump handler, e.g. `libc::SIGUSR2` (cf. `BACKBEAT_SIGNAL`). Parse a
+    /// user-supplied string with [`parse_signal`].
+    #[cfg(unix)]
+    pub signal: Option<i32>,
+    /// Install a panic hook that triggers a final dump (cf. `BACKBEAT_DUMP_ON_PANIC`).
+    pub dump_on_panic: Option<bool>,
+}
+
+impl Config {
+    /// Starts a [`ConfigBuilder`]. The unbuilt config leaves every field `None`, so building one
+    /// without setting anything reproduces the env-only behavior.
+    pub fn builder() -> ConfigBuilder {
+        ConfigBuilder {
+            config: Config::default(),
+        }
+    }
+}
+
+/// Builder for [`Config`]. Each setter accepts either a bare value or an `Option` (via
+/// `impl Into<Option<_>>`), so a caller translating from its own `Option`-typed config can forward
+/// fields directly (`.shards(self.shards)`), and one setting a literal can pass it plainly
+/// (`.enable(true)`). Passing `None` leaves the field unset (env/default fallback applies).
+#[derive(Clone, Debug, Default)]
+pub struct ConfigBuilder {
+    config: Config,
+}
+
+impl ConfigBuilder {
+    /// Arm capture when the recorder is built. See [`Config::enable`].
+    pub fn enable(mut self, enable: impl Into<Option<bool>>) -> Self {
+        self.config.enable = enable.into();
+        self
+    }
+
+    /// Target directory for dumps. See [`Config::dir`].
+    pub fn dir(mut self, dir: impl Into<Option<PathBuf>>) -> Self {
+        self.config.dir = dir.into();
+        self
+    }
+
+    /// Number of per-CPU shards. See [`Config::shards`].
+    pub fn shards(mut self, shards: impl Into<Option<usize>>) -> Self {
+        self.config.shards = shards.into();
+        self
+    }
+
+    /// Bytes per shard. See [`Config::bytes_per_shard`].
+    pub fn bytes_per_shard(mut self, bytes: impl Into<Option<usize>>) -> Self {
+        self.config.bytes_per_shard = bytes.into();
+        self
+    }
+
+    /// Minimum interval between dumps, in milliseconds. See [`Config::throttle_ms`].
+    pub fn throttle_ms(mut self, throttle_ms: impl Into<Option<u64>>) -> Self {
+        self.config.throttle_ms = throttle_ms.into();
+        self
+    }
+
+    /// Cap on the number of dump files kept (`0` = unlimited). See [`Config::max_dumps`].
+    pub fn max_dumps(mut self, max_dumps: impl Into<Option<u64>>) -> Self {
+        self.config.max_dumps = max_dumps.into();
+        self
+    }
+
+    /// Behavior at the dump-file cap. See [`Config::limit_policy`].
+    pub fn limit_policy(mut self, limit_policy: impl Into<Option<LimitPolicy>>) -> Self {
+        self.config.limit_policy = limit_policy.into();
+        self
+    }
+
+    /// Host label embedded in each dump. See [`Config::host`].
+    pub fn host(mut self, host: impl Into<Option<String>>) -> Self {
+        self.config.host = host.into();
+        self
+    }
+
+    /// Install a `kill -<sig>` dump handler. See [`Config::signal`].
+    #[cfg(unix)]
+    pub fn signal(mut self, signal: impl Into<Option<i32>>) -> Self {
+        self.config.signal = signal.into();
+        self
+    }
+
+    /// Install a panic hook that triggers a final dump. See [`Config::dump_on_panic`].
+    pub fn dump_on_panic(mut self, dump_on_panic: impl Into<Option<bool>>) -> Self {
+        self.config.dump_on_panic = dump_on_panic.into();
+        self
+    }
+
+    /// Finishes the builder, yielding the [`Config`] to hand to [`configure`]/[`init`].
+    pub fn build(self) -> Config {
+        self.config
+    }
+}
+
+/// The programmatic [`Config`] staged by [`configure`], consumed once by [`build`] on first use.
+/// Separate from [`GLOBAL`] so it can be written before the recorder is built.
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+/// Stages a programmatic [`Config`] for [`build`] to consult when the recorder is first used.
+///
+/// Call this once, early (e.g. from `main`), **before** the first
+/// [`record`]/[`trigger`]/[`recorder`]/[`enable`]. Returns `Err(config)` — handing the config back
+/// (boxed, since it is comfortably larger than the `Ok` unit), never panicking — if the recorder
+/// was **already built** (so the config would have no effect) or if [`configure`] was already
+/// called. Settings the config leaves unset still fall back to the `BACKBEAT_*` environment.
+pub fn configure(config: Config) -> Result<(), Box<Config>> {
+    // If the recorder is already built, the config is too late to matter.
+    if GLOBAL.get().is_some() {
+        return Err(Box::new(config));
+    }
+    CONFIG.set(config).map_err(Box::new)
+}
+
+/// [`configure`]s the recorder and then builds it eagerly, so `enable`, the dumper thread, and the
+/// signal handler take effect now rather than lazily on the first [`record`].
+///
+/// If the recorder was already built (or [`configure`] already ran), the config is ignored and a
+/// note is written to stderr — matching the module's best-effort, never-panic style.
+pub fn init(config: Config) {
+    if configure(config).is_err() {
+        eprintln!(
+            "backbeat: init/configure called after the recorder was already built or configured; \
+             configuration ignored"
+        );
+    }
+    // Force the build now so a staged config takes effect deterministically.
+    let _ = global();
+}
+
+/// Parses a `kill -<sig>` signal spec — `usr1`/`usr2` (case-insensitive) or a raw signal number —
+/// into the value expected by [`Config::signal`]. Returns `None` for an unrecognized spec.
+///
+/// A convenience for a config layer that accepts the signal as a string, so it need not duplicate
+/// the parsing (the same routine drives `BACKBEAT_SIGNAL`).
+#[cfg(unix)]
+pub fn parse_signal(s: &str) -> Option<i32> {
+    signal::parse(s)
 }
 
 /// Upper bound on the shard count derived from available parallelism, so a 256-core box does not
@@ -192,12 +390,25 @@ pub fn trigger() {
     g.dumper.condvar.notify_one();
 }
 
-/// Builds the global recorder from the environment and spawns the background dumper.
+/// Builds the global recorder and spawns the background dumper.
+///
+/// Each setting is drawn from the staged programmatic [`Config`] (if [`configure`]d) when that
+/// field is `Some`, otherwise from the setting's `BACKBEAT_*` environment variable, otherwise from
+/// the built-in default. When no `Config` is staged, every branch collapses to its original
+/// env-only expression, so the zero-config default is unchanged.
 fn build() -> Global {
-    let shards = env_usize("BACKBEAT_SHARDS")
+    // The staged programmatic config, if any. Reading through this `Option` keeps the no-config
+    // path identical to the historical env-only behavior.
+    let cfg = CONFIG.get();
+
+    let shards = cfg
+        .and_then(|c| c.shards)
+        .or_else(|| env_usize("BACKBEAT_SHARDS"))
         .unwrap_or_else(default_shards)
         .max(1);
-    let bytes = env_usize("BACKBEAT_BYTES")
+    let bytes = cfg
+        .and_then(|c| c.bytes_per_shard)
+        .or_else(|| env_usize("BACKBEAT_BYTES"))
         .unwrap_or(DEFAULT_BYTES_PER_SHARD)
         // Floor at one page: a ring must hold at least a full record, and a sub-record ring is
         // useless anyway.
@@ -205,32 +416,45 @@ fn build() -> Global {
 
     let recorder = Recorder::new(shards, bytes);
 
-    let path = std::env::var_os("BACKBEAT_PATH")
-        .map(PathBuf::from)
-        // PID-qualify the default so concurrent processes (or a test harness's per-test processes)
-        // don't clobber each other's numbered dumps.
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("backbeat.{}.bb", std::process::id()))
-        });
+    let path = resolve_base_path(
+        cfg.and_then(|c| c.dir.as_deref()),
+        std::env::var_os("BACKBEAT_PATH").map(PathBuf::from),
+        std::process::id(),
+    );
 
-    let throttle_ms = env_u64("BACKBEAT_THROTTLE_MS").unwrap_or(DEFAULT_THROTTLE_MS);
+    let throttle_ms = cfg
+        .and_then(|c| c.throttle_ms)
+        .or_else(|| env_u64("BACKBEAT_THROTTLE_MS"))
+        .unwrap_or(DEFAULT_THROTTLE_MS);
 
     // Unset → a modest default cap; explicit `0` → unlimited; any positive value → that cap. A cap
     // is on by default because each dump can be large (the full ring capacity per shard), so an
     // uncapped process that triggers repeatedly could accidentally fill the disk.
-    let max_dumps = match env_u64("BACKBEAT_MAX_DUMPS") {
+    let max_dumps = match cfg
+        .and_then(|c| c.max_dumps)
+        .or_else(|| env_u64("BACKBEAT_MAX_DUMPS"))
+    {
         None => Some(DEFAULT_MAX_DUMPS),
         Some(0) => None,
         Some(n) => Some(n),
     };
-    let limit_policy = std::env::var("BACKBEAT_LIMIT_POLICY")
-        .ok()
-        .and_then(|s| LimitPolicy::parse(&s))
+    let limit_policy = cfg
+        .and_then(|c| c.limit_policy)
+        .or_else(|| {
+            std::env::var("BACKBEAT_LIMIT_POLICY")
+                .ok()
+                .and_then(|s| LimitPolicy::parse(&s))
+        })
         .unwrap_or(LimitPolicy::KeepOldest);
 
-    let host = std::env::var("BACKBEAT_HOST")
-        .ok()
+    let host = cfg
+        .and_then(|c| c.host.clone())
         .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::env::var("BACKBEAT_HOST")
+                .ok()
+                .filter(|h| !h.is_empty())
+        })
         .unwrap_or_else(hostname);
 
     let dumper = Dumper {
@@ -248,26 +472,48 @@ fn build() -> Global {
         host,
     };
 
-    // Arm capture eagerly if asked, so a binary can be traced via env alone.
-    if env_truthy("BACKBEAT_ENABLE") {
+    // Arm capture eagerly if asked (via config or env), so a binary can be traced without a code
+    // change to call `enable`.
+    if cfg.and_then(|c| c.enable).unwrap_or(false) || env_truthy("BACKBEAT_ENABLE") {
         g.recorder.set_enabled(true);
     }
 
     spawn_dumper();
 
-    if env_truthy("BACKBEAT_DUMP_ON_PANIC") {
+    if cfg.and_then(|c| c.dump_on_panic).unwrap_or(false) || env_truthy("BACKBEAT_DUMP_ON_PANIC") {
         install_panic_hook();
     }
 
     #[cfg(unix)]
-    if let Some(sig) = std::env::var("BACKBEAT_SIGNAL")
-        .ok()
-        .and_then(|s| signal::parse(&s))
     {
-        signal::install_full(sig);
+        let sig = cfg.and_then(|c| c.signal).or_else(|| {
+            std::env::var("BACKBEAT_SIGNAL")
+                .ok()
+                .and_then(|s| signal::parse(&s))
+        });
+        if let Some(sig) = sig {
+            signal::install_full(sig);
+        }
     }
 
     g
+}
+
+/// Resolves the base dump-file path from the three inputs, in precedence order:
+///
+/// 1. a configured `dir` — the per-process base file within it is `backbeat.<pid>.bb`;
+/// 2. `BACKBEAT_PATH` (`env_path`) — a base *file* path used verbatim;
+/// 3. the PID-qualified temp-dir default `<TMPDIR>/backbeat.<pid>.bb`.
+///
+/// Each dump then inserts a UTC timestamp before the extension (see [`stamped_path`]). The PID
+/// qualifier on the `dir`/temp forms keeps concurrent processes (or a test harness's per-test
+/// processes) from clobbering each other's dumps. Factored out of [`build`] so it is unit-testable
+/// without the process-global recorder.
+fn resolve_base_path(dir: Option<&Path>, env_path: Option<PathBuf>, pid: u32) -> PathBuf {
+    match dir {
+        Some(dir) => dir.join(format!("backbeat.{pid}.bb")),
+        None => env_path.unwrap_or_else(|| std::env::temp_dir().join(format!("backbeat.{pid}.bb"))),
+    }
 }
 
 /// Default shard count: the machine's available parallelism, capped at [`MAX_DEFAULT_SHARDS`].
@@ -788,5 +1034,65 @@ mod tests {
             assert_eq!(env_truthy("BACKBEAT_TEST_TRUTHY"), want, "value {val:?}");
         }
         std::env::remove_var("BACKBEAT_TEST_TRUTHY");
+    }
+
+    #[test]
+    fn resolve_base_path_precedence() {
+        let pid = 4242;
+
+        // 1. A configured `dir` wins and yields `<dir>/backbeat.<pid>.bb`, ignoring env.
+        assert_eq!(
+            resolve_base_path(
+                Some(Path::new("/var/log/backbeat")),
+                Some(PathBuf::from("/env/base.bb")),
+                pid,
+            ),
+            PathBuf::from("/var/log/backbeat/backbeat.4242.bb"),
+        );
+
+        // 2. No dir → `BACKBEAT_PATH` (a base *file* path) is used verbatim.
+        assert_eq!(
+            resolve_base_path(None, Some(PathBuf::from("/env/base.bb")), pid),
+            PathBuf::from("/env/base.bb"),
+        );
+
+        // 3. Neither → the PID-qualified temp-dir default.
+        assert_eq!(
+            resolve_base_path(None, None, pid),
+            std::env::temp_dir().join("backbeat.4242.bb"),
+        );
+    }
+
+    #[test]
+    fn configure_stages_config_then_rejects_late_calls() {
+        // The recorder is a process-wide singleton (`GLOBAL`/`CONFIG`), so drive its whole
+        // lifecycle in one test rather than racing two tests on it: stage a config *before* first
+        // use, force the build, confirm the config took effect, then confirm a *late* configure is
+        // rejected (handing the config back) instead of silently having no effect.
+        let dir = std::env::temp_dir().join(format!("bb-cfg-test.{}", std::process::id()));
+        configure(Config::builder().enable(true).dir(dir.clone()).build())
+            .expect("configure before first use should succeed");
+
+        // Build the recorder (via `recorder()`), then verify the staged config was applied.
+        let _ = recorder();
+        assert!(is_enabled(), "config enable should arm capture");
+        assert_eq!(
+            dump_path(),
+            dir.join(format!("backbeat.{}.bb", std::process::id()))
+        );
+
+        // A configure after the recorder is built can no longer take effect, so it must return Err
+        // (handing the config back) rather than silently swallow it.
+        let late = configure(Config::builder().enable(true).build());
+        assert!(late.is_err(), "configure after build should return Err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_signal_matches_specs() {
+        assert_eq!(parse_signal("usr1"), Some(libc::SIGUSR1));
+        assert_eq!(parse_signal("USR2"), Some(libc::SIGUSR2));
+        assert_eq!(parse_signal("15"), Some(15));
+        assert_eq!(parse_signal("nope"), None);
     }
 }
