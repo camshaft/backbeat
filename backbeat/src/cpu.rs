@@ -51,9 +51,10 @@ fn raw_cpu() -> usize {
 ))]
 mod linux_rseq {
     //! Reads `cpu_id_start` out of the glibc-managed rseq TLS block. We only *read*; glibc owns
-    //! registration (AL2023+/modern glibc register rseq for every thread at startup). If the
-    //! symbols are absent or registration didn't happen, we report "unknown" and the caller falls
-    //! back to a single shard.
+    //! registration, which it does for every thread at startup from 2.35 onwards — the version that
+    //! also first exported `__rseq_offset`. Older libcs (Amazon Linux 2 is 2.26, Amazon Linux 2023 is
+    //! 2.34) neither register rseq nor export the symbol, so we report "unknown" and the caller falls
+    //! back to a single shard. The kernel is not the constraint: `rseq` has existed since Linux 4.18.
 
     use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -88,18 +89,42 @@ mod linux_rseq {
     }
 
     /// Resolves glibc's `__rseq_offset` once, caching the result. Returns the offset on success.
+    ///
+    /// Looked up through `dlsym` rather than declared as an `extern` static, because the symbol only
+    /// exists from glibc 2.35. As a static it is a strong undefined reference, so on an older libc
+    /// every binary linking this crate fails at link time — the "unavailable" path below is then
+    /// unreachable even though it is the correct answer. `dlsym` turns absence into a runtime `None`,
+    /// which `cpu_id_start` already handles by falling back to a single shard.
     #[cold]
     fn resolve() -> Option<usize> {
-        // `__rseq_offset` is a glibc global giving the TLS offset of the per-thread rseq area.
+        // `RTLD_DEFAULT` is NULL on glibc, meaning "search the global scope". Declared here rather
+        // than via the `libc` crate, which is an optional `std`-only dependency of this crate.
+        //
+        // `dl` is named explicitly because `dlsym` lived in `libdl` until glibc 2.34, which is newer
+        // than Amazon Linux 2's 2.26 — relying on whatever `std` happens to put on the link line
+        // would trade one undefined symbol for another there. Newer glibc still ships an empty
+        // `libdl.so.2` for compatibility, so naming it is harmless everywhere else.
+        #[link(name = "dl")]
         extern "C" {
-            #[link_name = "__rseq_offset"]
-            static RSEQ_OFFSET: isize;
+            fn dlsym(
+                handle: *mut core::ffi::c_void,
+                symbol: *const core::ffi::c_char,
+            ) -> *mut core::ffi::c_void;
         }
-        // The symbol is weak-ish across glibc versions; guard the read. On a glibc without rseq
-        // support the linker would fail, so absence shows up at build time, not here — but a
-        // zero/garbage offset is still possible on odd libcs, so we sanity-check below.
-        let offset = unsafe { RSEQ_OFFSET } as usize;
-        // A plausible TLS offset is small-ish and non-zero; treat anything absurd as unavailable.
+
+        // `__rseq_offset` is a glibc global giving the TLS offset of the per-thread rseq area.
+        // SAFETY: the name is a NUL-terminated C string, and `dlsym` reports absence by returning
+        // null, which is checked before any dereference.
+        let sym = unsafe { dlsym(core::ptr::null_mut(), c"__rseq_offset".as_ptr()) };
+        let Some(sym) = core::ptr::NonNull::new(sym.cast::<isize>()) else {
+            STATE.store(2, Ordering::Relaxed);
+            return None;
+        };
+
+        // SAFETY: `dlsym` resolved the address of glibc's `isize`-typed `__rseq_offset`.
+        let offset = unsafe { sym.as_ptr().read() } as usize;
+        // A plausible TLS offset is small-ish and non-zero. Zero means glibc never registered rseq
+        // for this thread, so there is no block to read.
         if offset == 0 {
             STATE.store(2, Ordering::Relaxed);
             return None;
