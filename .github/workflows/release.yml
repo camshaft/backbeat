@@ -17,8 +17,19 @@ name: release
 # AUTH: crates.io Trusted Publishing via GitHub OIDC (rust-lang/crates-io-auth-action) — NO
 # CARGO_REGISTRY_TOKEN, NO PAT. Because the publish runs in the same workflow run as release-plz
 # (not triggered by the tag), GitHub's anti-recursion rule never applies, so no elevated token is
-# needed. One-time per-crate setup: crates.io → each crate → Settings → Trusted Publishing → repo
-# `camshaft/backbeat`, workflow `release.yml`.
+# needed.
+#
+# ADOPTING THIS IN ANOTHER REPO (it is designed to be copied):
+#   1. Repo setting: Settings → Actions → General → Workflow permissions → enable "Allow GitHub
+#      Actions to create and approve pull requests". Without it the release-pr job 403s (the default
+#      GITHUB_TOKEN cannot open the release PR), even though the job grants pull-requests: write.
+#   2. crates.io Trusted Publisher, once per crate: crates.io → each crate → Settings → Trusted
+#      Publishing → repo `camshaft/<repo>`, workflow `release.yml`, environment blank. Do this AFTER
+#      this file exists on the repo's default branch. No token to paste.
+#   3. Pure-library repos: delete the `binaries` job (it only builds a CLI).
+#   4. If the repo's CI is CRON-ONLY (does not run on pushes/PRs to main), add a `gate` job here
+#      (fmt/clippy/test, mirroring that repo's CI) that the `release` job `needs:`, so a merge to main
+#      can't publish a red tree. backbeat omits it because its ci.yml already gates every push to main.
 
 on:
   push:
