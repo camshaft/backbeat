@@ -1,0 +1,104 @@
+name: release-plz
+
+# Fully-automatic, TOKENLESS release preparation on top of the reusable release.yml publisher.
+#
+# release-plz (https://release-plz.dev) watches `main` and:
+#   1. keeps a "release PR" open that bumps the workspace version and updates CHANGELOG.md from the
+#      conventional-commit history (for a 0.x crate: a breaking commit -> minor, otherwise patch);
+#   2. once that release PR is merged, creates the unified `v<version>` git tag.
+# The `release` job below then invokes release.yml IN THE SAME RUN (workflow_call) to run the gate,
+# build the per-target binaries, and publish the crates to crates.io via OIDC.
+#
+# TOKENLESS (option c): there is NO PAT and NO RELEASE_PLZ_TOKEN. A tag pushed with the default
+# GITHUB_TOKEN cannot trigger another workflow (GitHub's anti-recursion rule), so instead of relying
+# on the tag to trigger release.yml, we call release.yml directly as a reusable workflow in this same
+# run — no cross-workflow trigger, so no elevated token is needed. crates.io publishing stays on OIDC
+# Trusted Publishing (see release.yml).
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  # Keep the version-bump + CHANGELOG "release PR" open/updated. Its concurrency can cancel superseded
+  # runs; the tag/release jobs are separate so a pending release is never cancelled.
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+      - name: release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # After the release PR merges, create the unified `v<version>` tag (release-plz.toml disables its
+  # own publish + GitHub Release, so this only tags). Exposes whether a release happened + the tag, so
+  # the reusable release.yml can pick it up in this same run.
+  release-plz-tag:
+    name: release-plz tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+      - name: release-plz release
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Read the tag from release-plz's `releases` output — only when it actually released, so we
+      # never run jq over an empty output. All crates share one version, so releases[0].tag is the
+      # single v<version> tag.
+      - name: Extract release tag
+        id: tag
+        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          set -euo pipefail
+          tag="$(printf '%s' "$RELEASES" | jq -r '.[0].tag')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # Same-run publish: only when release-plz actually released. Reuses release.yml (gate -> binaries ->
+  # OIDC crates.io publish + GitHub Release) with the tag release-plz just created. No PAT, no
+  # cross-workflow trigger — this is a reusable-workflow call within this run.
+  release:
+    name: release
+    needs: release-plz-tag
+    if: ${{ needs.release-plz-tag.outputs.releases_created == 'true' }}
+    permissions:
+      contents: write # create the GitHub Release + upload binaries
+      id-token: write # crates.io Trusted Publishing (OIDC)
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-plz-tag.outputs.tag }}

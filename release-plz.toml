@@ -1,0 +1,31 @@
+# release-plz configuration — https://release-plz.dev/docs/config
+#
+# release-plz here ONLY prepares releases: it maintains the version-bump + CHANGELOG "release PR"
+# and, on merge, creates the unified `v<version>` git tag. crates.io publishing, the GitHub Release,
+# and the release binaries are handled by .github/workflows/release.yml, which release-plz.yml calls
+# in the same run (option c: tokenless, no PAT). So both crate-publishing and the GitHub Release are
+# disabled here.
+
+[workspace]
+# Do not run `cargo publish` — release.yml publishes to crates.io via OIDC.
+publish = false
+# Do not create the GitHub Release — release.yml (softprops/action-gh-release) creates it and
+# attaches the per-target binaries.
+git_release_enable = false
+# Unified tag with no per-package prefix. All three crates share one version, so the whole workspace
+# is released under a single `v<version>` tag (matching the historical scheme + release.yml's `v*`).
+git_tag_name = "v{{ version }}"
+
+# Emit EXACTLY ONE tag for the lockstep workspace: enable tagging on the primary crate only, so the
+# three same-version crates don't all resolve to — and collide on — the same `v<version>` tag.
+[[package]]
+name = "backbeat"
+git_tag_enable = true
+
+[[package]]
+name = "backbeat-cli"
+git_tag_enable = false
+
+[[package]]
+name = "backbeat-macros"
+git_tag_enable = false
