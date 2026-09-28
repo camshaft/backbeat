@@ -1,0 +1,78 @@
+name: release-plz
+
+# Fully-automatic release PREPARATION on top of the tag-triggered OIDC publish in release.yml.
+#
+# release-plz (https://release-plz.dev) watches `main` and:
+#   1. keeps a "release PR" open that bumps the workspace version and updates CHANGELOG.md from the
+#      conventional-commit history (for a 0.x crate: a breaking commit -> minor, otherwise patch);
+#   2. once that release PR is merged, creates the `v<version>` git tag.
+#
+# The tag then triggers release.yml, which runs the green gate, builds the per-target binaries, and
+# publishes the crates to crates.io via OIDC Trusted Publishing. So release-plz does NOT publish or
+# build binaries itself (publish + git_release are disabled in release-plz.toml) — it only automates
+# the version-bump/changelog PR and the tag, and release.yml stays the single publish mechanism.
+#
+# TOKEN — a tag pushed with the default GITHUB_TOKEN does NOT trigger other workflows, so release.yml
+# would never fire. release-plz therefore runs with a fine-grained PAT (RELEASE_PLZ_TOKEN: repo
+# Contents + Pull requests, read & write) passed via GITHUB_TOKEN, so its tag triggers release.yml
+# and its release PR runs CI. (A GitHub App token via actions/create-github-app-token is the
+# more-locked-down alternative; swap it in for the PAT if preferred.)
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  # Keep the version-bump + CHANGELOG "release PR" open/updated. Separate from the release job so its
+  # concurrency can cancel superseded runs without ever cancelling a pending release.
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+      - name: release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  # After the release PR merges, tag the new version. Publishing + binaries are release.yml's job
+  # (triggered by this tag); publish/git_release are disabled in release-plz.toml, so this only tags.
+  release-plz-release:
+    name: release-plz tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+      - name: release-plz release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

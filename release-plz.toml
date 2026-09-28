@@ -1,0 +1,15 @@
+# release-plz configuration — https://release-plz.dev/docs/config
+#
+# release-plz here ONLY prepares releases: it maintains the version-bump + CHANGELOG "release PR"
+# and, on merge, creates the `v<version>` git tag. crates.io publishing and the release binaries are
+# handled by .github/workflows/release.yml, which triggers on that tag (OIDC Trusted Publishing +
+# the per-target binary matrix). So both crate-publishing and the GitHub Release are disabled here.
+
+[workspace]
+# Do not run `cargo publish` — release.yml publishes to crates.io via OIDC on the tag.
+publish = false
+# Do not create the GitHub Release — release.yml (softprops/action-gh-release) creates it and
+# attaches the per-target binaries when the tag fires.
+git_release_enable = false
+# git_tag_enable defaults to true: release-plz creates the `v<version>` tag, which is what triggers
+# release.yml. (Left implicit so the default is obvious.)
