@@ -3,25 +3,85 @@ on:
     tags:
       - "v*"
   # Allow producing binaries on demand (e.g. to test the pipeline) without cutting a tag. A manual
-  # run uploads workflow artifacts but does not create/modify a GitHub Release.
+  # run builds + attaches nothing to a release and does NOT touch crates.io — it exercises the gate
+  # and the per-target binary build so the pipeline can be smoke tested before a real tag.
   workflow_dispatch:
 
 name: release
 
+# Publish the workspace crates to crates.io and attach per-target CLI binaries to the GitHub Release
+# when a version tag is pushed.
+#
+# AUTH — crates.io TRUSTED PUBLISHING via GitHub OIDC (no long-lived CARGO_REGISTRY_TOKEN secret).
+# The publish job requests an OIDC id-token and `rust-lang/crates-io-auth-action` exchanges it for a
+# short-lived, scoped crates.io token — nothing to store or rotate. ONE-TIME operator setup, once per
+# crate, before the first OIDC publish can succeed: on crates.io, each crate → Settings → Trusted
+# Publishing → add repository `camshaft/backbeat`, workflow `release.yml`. Until a crate's publisher
+# is registered its publish step fails auth; the job is idempotent, so a re-run after registration
+# completes cleanly.
+#
+# GATE — CI (ci.yml) runs on pushes/PRs to `main` but NOT on tags, so a tag push is otherwise
+# ungated. This workflow therefore runs its OWN green gate (fmt + clippy + no-std + test, mirroring
+# ci.yml) and both `build` and `publish` depend on it, so a tag can never ship a red tree.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  # Needed to create the GitHub Release and upload the binaries to it.
-  contents: write
+  contents: read
 
 env:
+  CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: 1
   # The binary cargo builds and the name we publish it under.
   BIN_NAME: backbeat
+  # rustfmt is pinned to nightly because .rustfmt.toml uses unstable options
+  # (format_macro_matchers, imports_granularity); keep in sync with ci.yml.
+  RUST_NIGHTLY_TOOLCHAIN: nightly-2026-01-14
 
 jobs:
+  # Green gate before any binary build or publish. Mirrors the publish-blocking checks in ci.yml
+  # (fmt / clippy / no-std / test) in one job so a tag build is self-gating even though the scheduled
+  # CI does not run on tags. (udeps is an unused-dependency hygiene check, not a publish blocker, so
+  # it is intentionally left to ci.yml and omitted here.)
+  gate:
+    name: gate (fmt + clippy + no-std + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Two toolchains: nightly for the unstable-options rustfmt, stable for clippy/build/test.
+      - name: Install rust toolchains
+        run: |
+          rustup toolchain install ${{ env.RUST_NIGHTLY_TOOLCHAIN }} --profile minimal --component rustfmt
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup override set stable
+
+      - uses: camshaft/rust-cache@v1
+
+      - name: fmt
+        run: cargo +${{ env.RUST_NIGHTLY_TOOLCHAIN }} fmt --all -- --check
+
+      - name: clippy
+        run: cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+
+      # The format/descriptor half must keep building without `std` (drops `std` + `capture`).
+      - name: no-std build
+        run: cargo +stable build -p backbeat --no-default-features
+
+      - name: test (all features)
+        run: cargo +stable test --workspace --all-features
+
   build:
     name: build ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
+    # Create the GitHub Release and upload the per-target binaries to it (on a tag push).
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -103,14 +163,18 @@ jobs:
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
 
-  # Publish the three crates to crates.io. Gated on `build` so we never publish a tag whose binaries
-  # don't compile, and only on a real tag push (a manual `workflow_dispatch` run produces artifacts
-  # without touching the registry). Requires a `CARGO_REGISTRY_TOKEN` repo secret.
+  # Publish the workspace crates to crates.io via Trusted Publishing (OIDC). Gated on both `gate`
+  # (never publish a red tree) and `build` (never publish a tag whose binaries don't compile), and
+  # only on a real tag push (a manual `workflow_dispatch` run stops after gate + build without
+  # touching the registry).
   publish:
     name: publish to crates.io
-    needs: build
+    needs: [gate, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for crates.io Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v7
 
@@ -121,36 +185,79 @@ jobs:
 
       - uses: camshaft/rust-cache@v1
 
-      # Publish in dependency order: macros, then the library that re-exports them, then the CLI.
-      # `cargo publish` (Rust 1.66+) blocks until each version is live on the index before returning,
-      # so the next crate in line resolves it. The workspace path deps carry an explicit `version`,
-      # so cargo strips the local path and points at the just-published crates.io release.
-      #
-      # Idempotent: each crate is skipped if its current version is already on crates.io. This lets
-      # the job re-run safely (e.g. a tag whose crates were published manually, or a partial earlier
-      # run) without failing on "crate version already exists".
+      # Exchange the GitHub OIDC id-token for a short-lived crates.io token (Trusted Publishing).
+      # Exposes it as an output consumed by the publish step below. No stored secret.
+      - name: crates.io auth (Trusted Publishing / OIDC)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Publish every workspace crate in DEPENDENCY ORDER, computed dynamically from `cargo metadata`
+      # (topologically sorted by intra-workspace normal/build deps) so a newly added crate is picked
+      # up automatically in the right place — no hand-maintained list to fall out of date. For the
+      # current members this yields: backbeat-macros → backbeat → backbeat-cli. `cargo publish` blocks
+      # until each version is live on the index before returning, so the next crate resolves it.
+      # Idempotent: a crate whose current version is already on the crates.io sparse index is skipped,
+      # so the job re-runs safely (a partial earlier run, or a crate registered/published later).
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
-          publish() {
+
+          # Workspace members only (`--no-deps`): emit "<dep> <crate>" edges for intra-workspace,
+          # non-dev dependencies, then `tsort` yields a dependency-first total order. Members with no
+          # in-workspace edges are appended after.
+          cargo metadata --no-deps --format-version 1 > /tmp/meta.json
+          mapfile -t MEMBERS < <(jq -r '.packages[].name' /tmp/meta.json | sort)
+          jq -r '
+            (.packages | map(.name)) as $members
+            | .packages[]
+            | .name as $crate
+            | .dependencies[]
+            | select(.kind != "dev")
+            | select(.name as $d | $members | index($d))
+            | "\(.name) \($crate)"
+          ' /tmp/meta.json | sort -u > /tmp/edges.txt
+
+          ORDER="$(tsort /tmp/edges.txt)"
+          for m in "${MEMBERS[@]}"; do
+            grep -qxF "$m" <<<"$ORDER" || ORDER="$ORDER"$'\n'"$m"
+          done
+          echo "Publish order:"; echo "$ORDER" | sed '/^$/d' | nl
+
+          published_version() {
             local crate="$1"
-            local version
-            version="$(cargo metadata --no-deps --format-version 1 \
-              | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')"
-            # crates.io's sparse index path: a 4+ char name lives at {chars1-2}/{chars3-4}/{name}.
-            # All of our crate names are longer than four chars. The file lists every published
-            # version, one JSON object per line, so a matching "vers" means it's already up.
+            jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version' /tmp/meta.json
+          }
+          is_publishable() {
+            # `.publish == null` → any registry; `.publish == []` → disabled; a list → allowed set.
+            local crate="$1"
+            jq -e --arg c "$crate" '
+              .packages[] | select(.name==$c)
+              | (.publish == null) or (.publish | index("crates-io") != null)
+            ' /tmp/meta.json >/dev/null 2>&1
+          }
+          already_on_cratesio() {
+            local crate="$1" version="$2"
+            # crates.io sparse index path for a 5+ char name: {c0c1}/{c2c3}/{name}. All backbeat
+            # crate names are longer than four chars. The file lists one JSON object per version.
             local url="https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}"
-            if curl -fsSL -A "backbeat-release-ci" "$url" 2>/dev/null \
-                | jq -re --arg v "$version" 'select(.vers == $v) | .vers' >/dev/null 2>&1; then
+            curl -fsSL -A "backbeat-release-ci" "$url" 2>/dev/null \
+              | jq -re --arg v "$version" 'select(.vers == $v) | .vers' >/dev/null 2>&1
+          }
+
+          while IFS= read -r crate; do
+            [ -n "$crate" ] || continue
+            if ! is_publishable "$crate"; then
+              echo "$crate: publish disabled in Cargo.toml; skipping."
+              continue
+            fi
+            version="$(published_version "$crate")"
+            if already_on_cratesio "$crate" "$version"; then
               echo "$crate $version already on crates.io; skipping."
             else
-              echo "Publishing $crate $version..."
+              echo "Publishing $crate $version ..."
+              # backbeat commits Cargo.lock, so honor it on the publish verify build.
               cargo publish --locked -p "$crate"
             fi
-          }
-          publish backbeat-macros
-          publish backbeat
-          publish backbeat-cli
+          done <<<"$ORDER"
