@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "backbeat"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bach",
  "backbeat-macros",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "backbeat-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "backbeat-macros"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
