@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format is based on
 (`backbeat`, `backbeat-cli`, `backbeat-macros`) share a single version, published together to
 [crates.io](https://crates.io) on every `v*` tag (see `.github/workflows/release.yml`).
 
-## [0.2.0] - 2026-09-28
+## [0.1.3] - 2026-09-28
 
 ### Added
 
@@ -37,5 +37,5 @@ Earlier releases (`0.1.0`–`0.1.2`) predate this changelog. See the
 [GitHub release notes](https://github.com/camshaft/backbeat/releases) and the git history for
 details.
 
-[0.2.0]: https://github.com/camshaft/backbeat/compare/v0.1.2...v0.2.0
+[0.1.3]: https://github.com/camshaft/backbeat/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/camshaft/backbeat/releases/tag/v0.1.2
