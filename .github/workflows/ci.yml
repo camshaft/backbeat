@@ -86,13 +86,13 @@ jobs:
 
       - uses: camshaft/rust-cache@v1
 
-      - uses: camshaft/install@v1
+      # Install a prebuilt cargo-udeps binary. Building it from source fails on
+      # our pinned nightly: cargo-udeps 0.1.61's transitive deps (cargo-util,
+      # kstring, cargo-credential-libsecret) now require rustc 1.96, newer than
+      # nightly-2026-01-14 (1.94). A prebuilt binary sidesteps that entirely.
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-udeps
-          # Use cargo-udeps' shipped Cargo.lock: its transitive deps
-          # (cargo-util, kstring, ...) require a newer rustc than our pinned
-          # nightly, so an unlocked install fails to compile.
-          locked: "true"
+          tool: cargo-udeps
 
       - name: Run cargo udeps
         run: cargo udeps --workspace --all-targets
