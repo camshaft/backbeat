@@ -154,5 +154,13 @@ jobs:
           archive: $bin-$target
           checksum: sha256
           locked: true
+          # Build natively (not via cross): cross v0.2.5's container images are
+          # amd64-only and can't run on the aarch64 runner. musl-tools (above)
+          # supplies the musl C compiler for the C-dependency build scripts
+          # (zstd-sys, lz4); point cc-rs at it via the target-specific CC vars.
+          build-tool: cargo
           ref: refs/tags/${{ needs.release.outputs.cli_tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
