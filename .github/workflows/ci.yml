@@ -89,6 +89,10 @@ jobs:
       - uses: camshaft/install@v1
         with:
           crate: cargo-udeps
+          # Use cargo-udeps' shipped Cargo.lock: its transitive deps
+          # (cargo-util, kstring, ...) require a newer rustc than our pinned
+          # nightly, so an unlocked install fails to compile.
+          locked: "true"
 
       - name: Run cargo udeps
         run: cargo udeps --workspace --all-targets
