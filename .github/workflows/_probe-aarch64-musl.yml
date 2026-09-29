@@ -1,7 +1,7 @@
-# TEMPORARY probe workflow — verifies how to build the backbeat CLI for
-# aarch64-unknown-linux-musl (which has C-dependency build scripts: zstd-sys,
-# lz4) on an aarch64 runner, since cross v0.2.5 cannot run on ARM hosts.
-# Deleted once the winning approach is folded into release.yml.
+# TEMPORARY probe workflow — verifies the native-cargo + musl-tools build
+# approach for the *-linux-musl CLI targets (which have C-dependency build
+# scripts: zstd-sys, lz4), on both arch runners, since cross v0.2.5 cannot run
+# on the aarch64 host. Deleted once folded into release.yml.
 name: probe-aarch64-musl
 
 on:
@@ -11,39 +11,24 @@ on:
 
 jobs:
   probe:
-    name: probe ${{ matrix.approach }}
-    runs-on: ubuntu-24.04-arm
+    name: probe ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        approach: [native-cc, zigbuild]
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v7
-
-      - name: Add rustup target
-        run: rustup target add aarch64-unknown-linux-musl
-
-      # Approach A: native cargo build, musl C compiler from musl-tools, cc-rs
-      # pointed at it via the target-specific CC var.
-      - name: Native build with musl-tools
-        if: matrix.approach == 'native-cc'
-        env:
-          CC_aarch64_unknown_linux_musl: musl-gcc
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: |
           cargo build --release --bin backbeat --locked \
-            --package backbeat-cli --target aarch64-unknown-linux-musl
-          file target/aarch64-unknown-linux-musl/release/backbeat
-
-      # Approach B: cargo-zigbuild — zig provides the C toolchain, host-arch
-      # agnostic, no cross containers.
-      - uses: taiki-e/install-action@v2
-        if: matrix.approach == 'zigbuild'
-        with:
-          tool: cargo-zigbuild
-      - name: Build with cargo-zigbuild
-        if: matrix.approach == 'zigbuild'
-        run: |
-          cargo zigbuild --release --bin backbeat --locked \
-            --package backbeat-cli --target aarch64-unknown-linux-musl
-          file target/aarch64-unknown-linux-musl/release/backbeat
+            --package backbeat-cli --target ${{ matrix.target }}
+          file target/${{ matrix.target }}/release/backbeat
