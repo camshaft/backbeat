@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/camshaft/backbeat/compare/backbeat-cli-v0.1.4...backbeat-cli-v0.1.5) - 2026-09-30
+
+### Other
+
+- *(deps)* bump arrow and parquet 59 -> 60 (supersedes #34, #35) ([#37](https://github.com/camshaft/backbeat/pull/37))
+
 ## [0.1.4](https://github.com/camshaft/backbeat/compare/backbeat-cli-v0.1.3...backbeat-cli-v0.1.4) - 2026-09-29
 
 ### Other
