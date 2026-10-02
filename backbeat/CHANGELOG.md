@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/camshaft/backbeat/compare/backbeat-v0.1.4...backbeat-v0.1.5) - 2026-10-02
+
+### Other
+
+- *(deps)* bump bach from 0.1.2 to 0.2.0 ([#40](https://github.com/camshaft/backbeat/pull/40))
+
 ## [0.1.4](https://github.com/camshaft/backbeat/compare/backbeat-v0.1.3...backbeat-v0.1.4) - 2026-09-30
 
 ### Other

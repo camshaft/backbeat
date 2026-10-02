@@ -14,7 +14,7 @@ edition = "2021"
 rust-version = "1.88"
 
 [workspace.dependencies]
-backbeat = { version = "0.1.4", path = "backbeat" }
+backbeat = { version = "0.1.5", path = "backbeat" }
 backbeat-macros = { version = "0.1.4", path = "backbeat-macros" }
 
 [profile.bench]
