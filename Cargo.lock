@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "backbeat"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bach",
  "backbeat-macros",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "backbeat-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "arrow",
