@@ -46,7 +46,7 @@ inventory = { version = "0.3", optional = true }
 bytes = { version = "1", default-features = false }
 # The `bach` feature makes the default clock query bach's simulated time when the recorder runs
 # inside a discrete-event simulation. Optional and off by default; pulled in only with `bach`.
-bach = { version = "0.1.2", optional = true }
+bach = { version = "0.2.0", optional = true }
 
 # The global recorder's optional `kill -<sig>` dump trigger installs a signal handler via libc.
 # Unix-only and only pulled in with `std` (the global recorder is `std`-only).
